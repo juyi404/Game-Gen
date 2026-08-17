@@ -1,0 +1,19 @@
+{
+  "id": "garden-defense-001",
+  "title": "微型花园防线",
+  "description": "制作一款轻量塔防游戏",
+  "rounds": [
+    {
+      "id": "initial-build",
+      "prompt": "请在当前目录制作一款可直接在浏览器运行的微型塔防游戏。玩家在花园小路旁放置三种植物，抵御至少五波害虫。需要资源系统、波次、升级、胜利、失败和重新开始，并以 index.html 作为入口。"
+    },
+    {
+      "id": "balance-and-feedback",
+      "prompt": "继续完善刚才的游戏：优化前五波的数值节奏，为三种植物提供明确差异，增加攻击、受击、消灭和升级反馈，并补充简洁的新手引导。请直接修改已有文件。"
+    }
+  ],
+  "metadata": {
+    "category": "strategy",
+    "difficulty": "medium"
+  }
+}

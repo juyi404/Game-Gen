@@ -1,0 +1,583 @@
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import { ControlPlane } from "../src/control-plane.js";
+import { BenchmarkDatabase } from "../src/database.js";
+import { OrchestratorManager } from "../src/manager.js";
+import { DashboardServer } from "../src/server/dashboard.js";
+
+const temporaryDirectories: string[] = [];
+
+afterEach(async () => {
+  await Promise.all(
+    temporaryDirectories.splice(0).map((directory) =>
+      rm(directory, { recursive: true, force: true }),
+    ),
+  );
+});
+
+describe("dashboard lifecycle actions", () => {
+  it("pauses, resumes, streams, cancels, retries, and serves artifacts", async () => {
+    const fixture = await createFixture();
+    try {
+      const dataset = await importDataset(fixture.url, 12, 2);
+      const experimentResponse = await postJson(fixture.url, "/api/experiments", {
+        name: "Dashboard lifecycle",
+        datasetId: dataset.id,
+        harness: "mock",
+        models: [{
+          id: "mock-high",
+          model: "vendor-a/game-model",
+          enabled: true,
+          concurrency: 1,
+          reasoningEffort: "high",
+        }],
+        globalConcurrency: 1,
+        providerConcurrency: { "vendor-a": 1 },
+        maxAttempts: 1,
+        roundTimeoutMs: 60_000,
+        retryBackoffMs: 1,
+      });
+      expect(
+        experimentResponse.response.status,
+        JSON.stringify(experimentResponse.body),
+      ).toBe(201);
+      const experiment = experimentResponse.body as {
+        id: string;
+        manifestPath: string;
+      };
+
+      const streamController = new AbortController();
+      const streamResponse = await fetch(
+        `${fixture.url}/api/stream?experimentId=${experiment.id}`,
+        { signal: streamController.signal },
+      );
+      expect(streamResponse.status).toBe(200);
+      expect(streamResponse.headers.get("content-type")).toContain("text/event-stream");
+      const streamReader = streamResponse.body!.getReader();
+
+      expect((await postJson(
+        fixture.url,
+        `/api/experiments/${experiment.id}/pause`,
+        {},
+      )).response.status).toBe(200);
+      expect(await readSseEventOfType(streamReader, "experiment.paused")).toMatchObject({
+        type: "experiment.paused",
+      });
+      await waitFor(async () => {
+        const detail = await getJson<ExperimentDetail>(
+          fixture.url,
+          `/api/experiments/${experiment.id}`,
+        );
+        return detail.experiment.status === "paused"
+          && detail.summary.running === 0
+          && detail.summary.preparing === 0;
+      });
+      const paused = await getJson<ExperimentDetail>(
+        fixture.url,
+        `/api/experiments/${experiment.id}`,
+      );
+      expect(paused.summary.completed).toBeLessThanOrEqual(1);
+      expect(paused.summary.queued).toBeGreaterThan(0);
+
+      expect((await postJson(
+        fixture.url,
+        `/api/experiments/${experiment.id}/resume`,
+        {},
+      )).response.status).toBe(200);
+      expect(await readSseEventOfType(streamReader, "experiment.resumed")).toMatchObject({
+        type: "experiment.resumed",
+      });
+      await waitFor(async () => {
+        const detail = await getJson<ExperimentDetail>(
+          fixture.url,
+          `/api/experiments/${experiment.id}`,
+        );
+        return detail.summary.completed >= 2;
+      });
+
+      expect((await postJson(
+        fixture.url,
+        `/api/experiments/${experiment.id}/cancel`,
+        {},
+      )).response.status).toBe(200);
+      await waitFor(async () => {
+        const detail = await getJson<ExperimentDetail>(
+          fixture.url,
+          `/api/experiments/${experiment.id}`,
+        );
+        return detail.experiment.status === "cancelled";
+      });
+      streamController.abort();
+      await streamReader.cancel().catch(() => undefined);
+
+      const cancelled = await getJson<ExperimentDetail>(
+        fixture.url,
+        `/api/experiments/${experiment.id}`,
+      );
+      expect(cancelled.summary.cancelled).toBeGreaterThan(0);
+      await waitFor(async () => {
+        const current = JSON.parse(await readFile(experiment.manifestPath, "utf8")) as {
+          status: string;
+        };
+        return current.status === "cancelled";
+      });
+      const manifest = JSON.parse(await readFile(experiment.manifestPath, "utf8")) as {
+        status: string;
+        runs: unknown[];
+      };
+      expect(manifest).toMatchObject({ status: "cancelled" });
+      expect(manifest.runs).toHaveLength(12);
+
+      const retryRun = cancelled.runs.find((run) => run.status === "cancelled")!;
+      expect((await postJson(fixture.url, `/api/runs/${retryRun.id}/retry`, {})).response.status)
+        .toBe(200);
+      await waitFor(async () => {
+        const detail = await getJson<{ run: { status: string } }>(
+          fixture.url,
+          `/api/runs/${retryRun.id}`,
+        );
+        return detail.run.status === "completed";
+      });
+
+      const runDetail = await getJson<{
+        run: { status: string; workspacePath: string };
+        resultPath: string;
+        roundContextDirectory: string;
+        rounds: Array<{ contextPath: string }>;
+      }>(fixture.url, `/api/runs/${retryRun.id}`);
+      expect(runDetail.run.status).toBe("completed");
+      expect(runDetail.roundContextDirectory).toContain("round-contexts");
+      expect(runDetail.rounds.every((round) => Boolean(round.contextPath))).toBe(true);
+      expect(JSON.parse(await readFile(runDetail.resultPath, "utf8"))).toMatchObject({
+        status: "completed",
+        rounds: [{ status: "completed" }, { status: "completed" }],
+      });
+
+      const artifactResponse = await fetch(`${fixture.url}/artifacts/${retryRun.id}/`);
+      expect(artifactResponse.status).toBe(200);
+      expect(await artifactResponse.text()).toContain("Lifecycle game");
+      expect((await fetch(
+        `${fixture.url}/artifacts/${retryRun.id}/.benchmark/result.json`,
+      )).status).toBe(403);
+      expect((await fetch(`${fixture.url}/app.js`)).status).toBe(200);
+      expect((await fetch(`${fixture.url}/styles.css`)).status).toBe(200);
+      expect((await fetch(`${fixture.url}/api/stream?experimentId=missing`)).status).toBe(400);
+
+      const experiments = await getJson<Array<{ id: string }>>(fixture.url, "/api/experiments");
+      expect(experiments).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: experiment.id }),
+      ]));
+    } finally {
+      await fixture.close();
+    }
+  }, 20_000);
+
+  it("advances manual stages through the API without replacing context state", async () => {
+    const fixture = await createFixture();
+    try {
+      const dataset = await importDataset(fixture.url, 1, 3);
+      const created = await postJson(fixture.url, "/api/experiments", {
+        name: "Manual stages",
+        datasetId: dataset.id,
+        harness: "mock",
+        stageMode: "manual",
+        models: [{
+          id: "mock-staged",
+          model: "vendor-a/game-model",
+          enabled: true,
+          concurrency: 1,
+        }],
+        globalConcurrency: 1,
+        providerConcurrency: { "vendor-a": 1 },
+        maxAttempts: 1,
+        roundTimeoutMs: 60_000,
+        retryBackoffMs: 1,
+      });
+      expect(created.response.status).toBe(201);
+      const experiment = created.body as {
+        id: string;
+        stageMode: string;
+        targetRound: number;
+        maxRounds: number;
+      };
+      expect(experiment).toMatchObject({
+        stageMode: "manual",
+        targetRound: 1,
+        maxRounds: 3,
+      });
+
+      await waitFor(async () => {
+        const detail = await getJson<ExperimentDetail>(
+          fixture.url,
+          `/api/experiments/${experiment.id}`,
+        );
+        return detail.experiment.status === "awaiting_stage";
+      });
+      const first = await getJson<ExperimentDetail>(
+        fixture.url,
+        `/api/experiments/${experiment.id}`,
+      );
+      expect(first.summary).toMatchObject({ awaitingStage: 1, completed: 0 });
+      expect(first.roundSummary).toMatchObject({ total: 3, completed: 1, pending: 2 });
+      expect(first.runs[0]).toMatchObject({
+        status: "awaiting_stage",
+        currentRound: 1,
+        attempt: 1,
+      });
+      const originalRun = first.runs[0]!;
+
+      expect((await postJson(
+        fixture.url,
+        `/api/experiments/${experiment.id}/advance-stage`,
+        {},
+      )).response.status).toBe(200);
+      await waitFor(async () => {
+        const detail = await getJson<ExperimentDetail>(
+          fixture.url,
+          `/api/experiments/${experiment.id}`,
+        );
+        return detail.experiment.status === "awaiting_stage"
+          && detail.experiment.targetRound === 2;
+      });
+      const second = await getJson<ExperimentDetail>(
+        fixture.url,
+        `/api/experiments/${experiment.id}`,
+      );
+      expect(second.runs[0]).toMatchObject({
+        status: "awaiting_stage",
+        currentRound: 2,
+        attempt: 1,
+        workspacePath: originalRun.workspacePath,
+        sessionId: originalRun.sessionId,
+      });
+      expect(second.roundSummary).toMatchObject({ completed: 2, pending: 1 });
+
+      expect((await postJson(
+        fixture.url,
+        `/api/experiments/${experiment.id}/advance-stage`,
+        {},
+      )).response.status).toBe(200);
+      await waitFor(async () => {
+        const detail = await getJson<ExperimentDetail>(
+          fixture.url,
+          `/api/experiments/${experiment.id}`,
+        );
+        return detail.experiment.status === "completed";
+      });
+      const completed = await getJson<ExperimentDetail>(
+        fixture.url,
+        `/api/experiments/${experiment.id}`,
+      );
+      expect(completed.experiment).toMatchObject({ targetRound: 3, maxRounds: 3 });
+      expect(completed.runs[0]).toMatchObject({
+        status: "completed",
+        currentRound: 3,
+        attempt: 1,
+        workspacePath: originalRun.workspacePath,
+        sessionId: originalRun.sessionId,
+      });
+      expect(completed.roundSummary).toMatchObject({ completed: 3, pending: 0 });
+      expect((await postJson(
+        fixture.url,
+        `/api/experiments/${experiment.id}/advance-stage`,
+        {},
+      )).response.status).toBe(409);
+    } finally {
+      await fixture.close();
+    }
+  }, 15_000);
+
+  it("validates uploads and completes API key and OAuth routes", async () => {
+    const fixture = await createFixture();
+    try {
+      const wrongContentType = await fetch(`${fixture.url}/api/datasets/import`, {
+        method: "POST",
+        headers: { "Content-Type": "text/plain" },
+        body: "{}",
+      });
+      expect(wrongContentType.status).toBe(415);
+
+      const malformed = await fetch(`${fixture.url}/api/datasets/import`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{",
+      });
+      expect(malformed.status).toBe(400);
+
+      const traversal = await postJson(fixture.url, "/api/datasets/import", {
+        name: "Traversal",
+        files: [{ path: "../outside.json", content: taskJson("outside", 1) }],
+      });
+      expect(traversal.response.status).toBe(400);
+
+      const duplicate = await postJson(fixture.url, "/api/datasets/import", {
+        name: "Duplicate path",
+        files: [
+          { path: "same.json", content: taskJson("one", 1) },
+          { path: "same.json", content: taskJson("two", 1) },
+        ],
+      });
+      expect(duplicate.response.status).toBe(400);
+      expect(await getJson<unknown[]>(fixture.url, "/api/setup").then(() => true)).toBe(true);
+
+      expect((await postJson(fixture.url, "/api/auth/api-key", {
+        providerId: "vendor-a",
+        key: "local-test-secret",
+      })).response.status).toBe(200);
+      expect(fixture.calls.apiKeys).toEqual([{
+        providerId: "vendor-a",
+        key: "local-test-secret",
+      }]);
+
+      const oauth = await postJson(fixture.url, "/api/auth/oauth/start", {
+        providerId: "vendor-a",
+        method: 1,
+      });
+      expect(oauth).toMatchObject({
+        response: { status: 200 },
+        body: {
+          url: "https://example.invalid/authorize",
+          method: "code",
+          instructions: "Sign in",
+        },
+      });
+      expect((await postJson(fixture.url, "/api/auth/oauth/complete", {
+        providerId: "vendor-a",
+        method: 1,
+        code: "oauth-code",
+      })).response.status).toBe(200);
+      expect(fixture.calls.oauth).toEqual([
+        { action: "start", providerId: "vendor-a", method: 1 },
+        { action: "complete", providerId: "vendor-a", method: 1, code: "oauth-code" },
+      ]);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("rejects browser credential writes on non-loopback dashboards", async () => {
+    const fixture = await createFixture("0.0.0.0");
+    try {
+      const response = await postJson(fixture.url, "/api/auth/api-key", {
+        providerId: "vendor-a",
+        key: "must-not-be-written",
+      });
+      expect(response.response.status).toBe(400);
+      expect(response.body).toMatchObject({ error: expect.stringContaining("只允许") });
+      expect(fixture.calls.apiKeys).toEqual([]);
+    } finally {
+      await fixture.close();
+    }
+  });
+});
+
+interface ExperimentDetail {
+  experiment: { id: string; status: string; targetRound: number; maxRounds: number };
+  summary: {
+    queued: number;
+    preparing: number;
+    running: number;
+    awaitingStage: number;
+    completed: number;
+    failed: number;
+    cancelled: number;
+  };
+  roundSummary: {
+    total: number;
+    pending: number;
+    running: number;
+    completed: number;
+    failed: number;
+  };
+  runs: Array<{
+    id: string;
+    status: string;
+    currentRound: number;
+    attempt: number;
+    workspacePath: string | null;
+    sessionId: string | null;
+  }>;
+}
+
+async function createFixture(hostname = "127.0.0.1") {
+  const directory = await mkdtemp(path.join(tmpdir(), "gamebench-dashboard-actions-"));
+  temporaryDirectories.push(directory);
+  const dataDir = path.join(directory, "data");
+  const db = new BenchmarkDatabase(path.join(dataDir, "benchmark.sqlite"));
+  const manager = new OrchestratorManager(db);
+  const calls = {
+    apiKeys: [] as Array<{ providerId: string; key: string }>,
+    oauth: [] as Array<Record<string, unknown>>,
+  };
+  const providerGateway = {
+    expectedUrl: "http://127.0.0.1:4096",
+    url: "http://127.0.0.1:4096",
+    async start() {},
+    async listProviders() {
+      return [{
+        id: "vendor-a",
+        name: "Vendor A",
+        connected: true,
+        env: [],
+        authMethods: [
+          { type: "api" as const, label: "API Key", index: 0 },
+          { type: "oauth" as const, label: "OAuth", index: 1 },
+        ],
+        models: [{
+          id: "game-model",
+          name: "Game Model",
+          toolCall: true,
+          reasoning: true,
+          reasoningEfforts: ["low", "high"],
+          status: "active",
+        }],
+      }];
+    },
+    async listPackyProviders() { return []; },
+    async listPackyCatalog() {
+      return { source: "test", fetchedAt: 1, vendors: [], groups: [], models: [] };
+    },
+    async listPackyAuthorizedModels() { return ["game-model"]; },
+    async configurePackyProvider() { throw new Error("not used"); },
+    async setApiKey(providerId: string, key: string) {
+      calls.apiKeys.push({ providerId, key });
+    },
+    async startOAuth(providerId: string, method: number) {
+      calls.oauth.push({ action: "start", providerId, method });
+      return {
+        url: "https://example.invalid/authorize",
+        method: "code" as const,
+        instructions: "Sign in",
+      };
+    },
+    async completeOAuth(providerId: string, method: number, code?: string) {
+      calls.oauth.push({ action: "complete", providerId, method, code });
+    },
+    close() {},
+  };
+  const controlPlane = new ControlPlane(manager, {
+    projectRoot: directory,
+    dataDir,
+    outputDir: path.join(directory, "runs"),
+    workspaceTemplate: path.resolve("examples/template"),
+    dashboard: { hostname, port: 8787 },
+    opencode: {
+      hostname: "127.0.0.1",
+      port: 4096,
+      startupTimeoutMs: 5_000,
+      agent: "build",
+      config: {},
+    },
+  }, providerGateway);
+  await controlPlane.initialize();
+  const dashboard = new DashboardServer(db, manager, controlPlane, { hostname, port: 0 });
+  const startedUrl = await dashboard.start();
+  const url = startedUrl.replace("0.0.0.0", "127.0.0.1");
+  return {
+    directory,
+    db,
+    manager,
+    controlPlane,
+    dashboard,
+    url,
+    calls,
+    async close() {
+      await manager.shutdown();
+      await dashboard.close();
+      controlPlane.close();
+      db.close();
+    },
+  };
+}
+
+async function importDataset(url: string, tasks: number, rounds: number) {
+  const response = await postJson(url, "/api/datasets/import", {
+    name: "Lifecycle dataset",
+    files: Array.from({ length: tasks }, (_, index) => ({
+      path: `games/game-${index + 1}.json`,
+      content: taskJson(`lifecycle-${index + 1}`, rounds),
+    })),
+  });
+  expect(response.response.status).toBe(201);
+  return response.body as { id: string };
+}
+
+function taskJson(id: string, rounds: number): string {
+  return JSON.stringify({
+    id,
+    title: `Lifecycle game ${id}`,
+    rounds: Array.from({ length: rounds }, (_, index) => ({
+      id: `round-${index + 1}`,
+      prompt: `prompt ${index + 1}`,
+    })),
+  });
+}
+
+async function postJson(url: string, pathname: string, body: unknown) {
+  const response = await fetch(`${url}${pathname}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return {
+    response,
+    body: await response.json() as unknown,
+  };
+}
+
+async function getJson<T>(url: string, pathname: string): Promise<T> {
+  const response = await fetch(`${url}${pathname}`);
+  expect(response.status).toBe(200);
+  return await response.json() as T;
+}
+
+async function waitFor(predicate: () => Promise<boolean>, timeoutMs = 8_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error("timed out waiting for dashboard state");
+}
+
+async function readSseEvent(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  timeoutMs = 3_000,
+): Promise<Record<string, unknown>> {
+  const decoder = new TextDecoder();
+  let buffer = "";
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const remaining = Math.max(1, deadline - Date.now());
+    const result = await Promise.race([
+      reader.read(),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("timed out waiting for SSE event")), remaining),
+      ),
+    ]);
+    if (result.done) throw new Error("SSE stream closed before an event arrived");
+    buffer += decoder.decode(result.value, { stream: true });
+    const events = buffer.split("\n\n");
+    buffer = events.pop() ?? "";
+    for (const event of events) {
+      const data = event.split("\n").find((line) => line.startsWith("data: "));
+      if (data) return JSON.parse(data.slice(6)) as Record<string, unknown>;
+    }
+  }
+  throw new Error("timed out waiting for SSE event");
+}
+
+async function readSseEventOfType(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  type: string,
+  timeoutMs = 3_000,
+): Promise<Record<string, unknown>> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const event = await readSseEvent(reader, Math.max(1, deadline - Date.now()));
+    if (event.type === type) return event;
+  }
+  throw new Error(`timed out waiting for SSE event ${type}`);
+}

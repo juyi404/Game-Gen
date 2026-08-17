@@ -1,0 +1,31 @@
+{
+  "name": "game-generation-benchmark",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "High-concurrency game generation benchmark harness powered by OpenCode",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "dev": "tsx src/cli.ts",
+    "build": "tsc -p tsconfig.json && node scripts/copy-public.mjs",
+    "start": "node dist/src/cli.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "verify:live": "node scripts/verify-live-packy.mjs",
+    "verify:models": "node scripts/verify-connected-models.mjs",
+    "verify:all": "npm run typecheck && npm test && npm run build && npm run verify:live"
+  },
+  "dependencies": {
+    "@opencode-ai/sdk": "1.18.18",
+    "opencode-ai": "1.18.18",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0",
+    "vitest": "^3.2.0"
+  }
+}

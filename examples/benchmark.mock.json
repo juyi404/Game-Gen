@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "name": "Game Generation · 本地 Mock 演示",
+  "dataset": {
+    "dir": "./tasks",
+    "include": []
+  },
+  "models": [
+    { "id": "gpt-5", "model": "openai/gpt-5", "concurrency": 2 },
+    { "id": "claude-sonnet", "model": "anthropic/claude-sonnet-4-5", "concurrency": 2 },
+    { "id": "deepseek-chat", "model": "deepseek/deepseek-chat", "concurrency": 2 },
+    { "id": "kimi-k2", "model": "moonshotai/kimi-k2.5", "concurrency": 2 },
+    { "id": "grok-4", "model": "xai/grok-4", "concurrency": 2 }
+  ],
+  "runtime": {
+    "harness": "mock",
+    "globalConcurrency": 8,
+    "providerConcurrency": {
+      "openai": 4,
+      "anthropic": 4,
+      "deepseek": 4,
+      "moonshotai": 4,
+      "xai": 4
+    },
+    "workspaceTemplate": "./template",
+    "outputDir": "../runs/mock",
+    "dataDir": "../.gamebench/mock",
+    "roundTimeoutMs": 0,
+    "maxAttempts": 2,
+    "retryBackoffMs": 500
+  },
+  "dashboard": {
+    "hostname": "127.0.0.1",
+    "port": 8787
+  },
+  "mock": {
+    "delayMs": 350,
+    "failTaskIds": []
+  }
+}

@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <title>游戏批量生成台</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="游戏批量生成台">
+        <span class="brand-mark">GB</span>
+        <span><strong>GameBench</strong><small>游戏源码批量生成台</small></span>
+      </a>
+      <nav class="workspace-nav" aria-label="工作区">
+        <button class="nav-button active" data-view="setup">新建任务</button>
+        <button class="nav-button" data-view="monitor">生成监控 <span id="active-run-badge" class="nav-badge hidden"></span></button>
+      </nav>
+      <div class="topbar-spacer"></div>
+      <div id="experiment-picker" class="experiment-picker hidden">
+        <label for="experiment-select">历史任务</label>
+        <select id="experiment-select"></select>
+      </div>
+      <span id="connection" class="connection"><i></i>正在连接</span>
+    </header>
+
+    <main>
+      <section id="setup-view" class="view setup-view">
+        <div class="studio-hero">
+          <div>
+            <p class="eyebrow">批量生成控制台</p>
+            <h1>创建一批游戏源码生成任务</h1>
+            <p>上传全部题目、选择实际可用的模型并设置并发，然后一键生成。</p>
+          </div>
+          <div id="setup-readiness" class="readiness-pill"><i></i><span>正在检查配置</span></div>
+        </div>
+
+        <div class="setup-layout">
+          <div class="setup-flow">
+            <section class="step-card panel" data-step="1">
+              <header class="step-heading">
+                <span class="step-number">01</span>
+                <div><p class="section-kicker">第一步 · 题库</p><h2>导入游戏题目 JSON</h2><span>支持每题一个 JSON，也支持单个文件用 <code>games</code> 数组保存全部题目；多轮 Prompt 按 <code>rounds</code> 顺序执行。</span></div>
+                <span id="dataset-step-state" class="step-state pending">未选择</span>
+              </header>
+
+              <div id="upload-zone" class="upload-zone" tabindex="0" role="button" aria-label="选择 JSON 文件">
+                <div class="upload-icon">↑</div>
+                <div><strong>拖入题库 JSON，或点击选择文件</strong><span>可上传一个聚合文件、多个题目文件，或选择整个题库文件夹</span></div>
+                <div class="upload-actions">
+                  <button id="choose-files-button" class="button secondary" type="button">选择多个 JSON</button>
+                  <button id="choose-folder-button" class="button ghost" type="button">选择文件夹</button>
+                </div>
+              </div>
+              <input id="dataset-files" class="visually-hidden" type="file" accept="application/json,.json" multiple />
+              <input id="dataset-folder" class="visually-hidden" type="file" accept="application/json,.json" multiple webkitdirectory />
+
+              <div id="upload-staging" class="upload-staging hidden">
+                <div class="staging-copy"><strong id="staged-file-count">0 个文件已选择</strong><span id="staged-file-size">等待导入</span></div>
+                <label class="field compact-field"><span>题库名称</span><input id="dataset-name" type="text" maxlength="160" placeholder="例如：Web Games Benchmark v1" /></label>
+                <button id="upload-dataset-button" class="button primary" type="button">校验并导入</button>
+                <button id="clear-upload-button" class="button ghost" type="button">清除</button>
+              </div>
+              <div id="upload-progress" class="upload-progress hidden"><div><i id="upload-progress-bar"></i></div><span id="upload-progress-label">正在读取文件…</span></div>
+
+              <div class="dataset-library">
+                <div class="subheading"><div><h3>已导入题库</h3><span>题库会保存在本机，下次打开无需重新上传。</span></div></div>
+                <div id="dataset-list" class="dataset-list"></div>
+                <div id="dataset-empty" class="empty-state">还没有题库，先上传一批游戏 JSON。</div>
+              </div>
+            </section>
+
+            <section class="step-card panel" data-step="2">
+              <header class="step-heading">
+                <span class="step-number">02</span>
+                <div><p class="section-kicker">第二步 · 模型</p><h2>选择模型并连接供应商</h2><span>每道题都会分别交给所有启用的模型；密钥只写入本机 OpenCode 凭据库。</span></div>
+                <span id="model-step-state" class="step-state pending">待配置</span>
+              </header>
+
+              <div class="model-toolbar">
+                <div id="credential-summary" class="credential-summary"><i></i><span>尚未检查本机模型与登录状态</span></div>
+                <div class="toolbar-actions">
+                  <button id="provider-manager-button" class="button secondary" type="button">供应商与模型</button>
+                  <button id="sync-models-button" class="button secondary" type="button">刷新接入状态</button>
+                  <button id="add-model-button" class="button primary" type="button">＋ 添加空行</button>
+                </div>
+              </div>
+
+              <div class="model-table-wrap">
+                <table class="model-config-table">
+                  <thead><tr><th>启用</th><th>显示名称</th><th>模型选择</th><th>推理强度</th><th>单模型并发</th><th>接入检查</th><th></th></tr></thead>
+                  <tbody id="model-rows"></tbody>
+                </table>
+              </div>
+              <datalist id="model-catalog-options"></datalist>
+              <p class="table-hint">推理强度按“供应商 + 模型”动态读取：同名模型经不同供应商接入时，可选档位也可能不同。页面只显示 OpenCode 实际返回的 none、minimal、low、medium、high、xhigh、max、ultra 等可用子集；没有可调档位时使用供应商默认行为。GPT-5.6 API 的最高推理档位是 max；Codex 的 ultra 是多代理执行模式，不会伪装成模型 API 档位。</p>
+            </section>
+
+            <section class="step-card panel" data-step="3">
+              <header class="step-heading">
+                <span class="step-number">03</span>
+                <div><p class="section-kicker">第三步 · 生成策略</p><h2>设置阶段、并发与容错</h2><span>选择一次跑完全部 Prompt，或每次只跑一轮并在监控页手动推进下一阶段。</span></div>
+                <span id="policy-step-state" class="step-state ready">已配置</span>
+              </header>
+
+              <label class="switch-field stage-mode-option"><input id="staged-mode" type="checkbox" checked /><span><strong>分阶段生成（推荐）</strong><small>首次只生成第 1 轮。整批完成后由你手动启动第 2 轮；后续阶段继续使用每个游戏原来的源码目录、OpenCode 会话和历史上下文。</small></span></label>
+
+              <div class="policy-grid">
+                <label class="field featured"><span>全局最大并发 <small>同时生成的游戏总数</small></span><input id="global-concurrency" type="number" min="1" max="1000" value="16" /></label>
+                <label class="field"><span>失败最大尝试次数</span><input id="max-attempts" type="number" min="1" max="10" value="3" /></label>
+                <label class="field"><span>单轮时限 <small>模型完成或自身报错后才结束</small></span><input id="round-timeout" type="text" value="不限时" readonly aria-label="单轮时限：不限时" /></label>
+                <label class="field"><span>重试等待（秒）</span><input id="retry-backoff" type="number" min="0" max="3600" value="15" /></label>
+              </div>
+
+              <div class="provider-limits-block">
+                <div class="subheading"><div><h3>供应商并发上限</h3><span>同一供应商下多个模型共享该上限。</span></div><button id="balance-concurrency-button" class="text-button" type="button">按全局并发自动分配</button></div>
+                <div id="provider-limits" class="provider-limits"></div>
+              </div>
+
+              <details class="advanced-settings">
+                <summary>高级设置</summary>
+                <div class="advanced-grid">
+                  <label class="switch-field"><input id="mock-mode" type="checkbox" /><span><strong>流程演练模式</strong><small>不调用真实模型，用于先验证题库、矩阵、并发和结果保存流程。</small></span></label>
+                  <label class="field system-field"><span>全局 System Prompt（可选）</span><textarea id="system-prompt" rows="4" placeholder="留空时使用框架默认的游戏生成指令"></textarea></label>
+                </div>
+              </details>
+            </section>
+          </div>
+
+          <aside class="launch-card panel">
+            <p class="section-kicker">启动前确认</p>
+            <h2>启动生成</h2>
+            <label class="field experiment-name-field"><span>本次任务名称</span><input id="new-experiment-name" type="text" maxlength="160" value="游戏批量生成" /></label>
+            <div class="output-location launch-output-location">
+              <span>源码保存根目录</span>
+              <code id="launch-output-dir">正在读取…</code>
+              <button id="copy-launch-output" class="text-button" type="button">复制目录</button>
+              <small>目录按“游戏名 / 模型名”组织；每个“游戏 × 模型”只有一份源码，所有 Prompt 轮次都在原目录继续修改。</small>
+            </div>
+            <div class="launch-metrics">
+              <div><span>题目</span><strong id="launch-task-count">0</strong></div>
+              <div><span>模型</span><strong id="launch-model-count">0</strong></div>
+              <div><span>生成运行</span><strong id="launch-run-count">0</strong></div>
+              <div><span>全局并发</span><strong id="launch-concurrency">16</strong></div>
+            </div>
+            <div class="matrix-formula"><span>运行矩阵</span><strong id="matrix-formula">0 道题 × 0 个模型</strong></div>
+            <div id="launch-checklist" class="launch-checklist"></div>
+            <button id="start-generation-button" class="button launch-button" type="button" disabled><span>开始批量生成</span><small id="start-generation-subtitle">先生成第 1 阶段，后续手动续跑</small></button>
+            <button id="open-active-button" class="button secondary full-width hidden" type="button">查看当前运行</button>
+            <p class="launch-note">真实生成会产生模型 API 费用。启动后可在监控页暂停派发或取消任务。</p>
+          </aside>
+        </div>
+      </section>
+
+      <section id="monitor-view" class="view monitor-view hidden">
+        <div class="monitor-shell">
+          <section class="monitor-hero">
+            <div><p class="eyebrow">实时生成监控</p><h1 id="experiment-name">生成任务</h1><p id="experiment-meta" class="muted">请选择一个任务。</p></div>
+            <div class="hero-actions">
+              <span id="experiment-status" class="status-pill status-queued">等待中</span>
+              <button id="pause-button" class="button secondary">暂停派发</button>
+              <button id="resume-button" class="button primary">继续运行</button>
+              <button id="cancel-button" class="button danger">取消任务</button>
+            </div>
+          </section>
+
+          <div id="monitor-empty" class="panel monitor-empty hidden"><strong>还没有生成任务</strong><span>先在“新建任务”中上传题库并启动。</span><button class="button primary" data-view="setup">创建第一个任务</button></div>
+          <div id="monitor-content">
+            <section id="summary-cards" class="summary-grid" aria-label="运行摘要"></section>
+            <section class="progress-panel panel">
+              <div class="panel-heading compact"><div><p class="section-kicker">整批进度</p><h2>总体生成进度</h2></div><strong id="progress-number" class="progress-number">0%</strong></div>
+              <div class="progress-track"><i id="progress-bar"></i></div>
+              <div id="progress-caption" class="progress-caption"></div>
+            </section>
+            <section id="stage-control" class="stage-control panel hidden">
+              <div class="stage-control-copy"><p class="section-kicker">分阶段生成</p><h2 id="stage-control-title">第 1 阶段</h2><p id="stage-control-description">本阶段生成完成后，可手动启动下一阶段。</p><span id="stage-context-note">下一阶段会沿用同一源码目录、OpenCode 会话和全部历史上下文。</span></div>
+              <div class="stage-control-action"><strong id="stage-control-progress">1 / 1</strong><button id="advance-stage-button" class="button primary" type="button" disabled>等待本阶段完成</button></div>
+            </section>
+            <section class="output-location monitor-output-location panel">
+              <div><span>本次任务的源码目录</span><code id="monitor-output-dir">尚未创建</code><small id="monitor-manifest-path">任务完成后会在此处生成 manifest.json 结果清单。</small></div>
+              <button id="copy-monitor-output" class="button secondary" type="button">复制源码目录</button>
+            </section>
+            <div class="content-grid">
+              <section class="panel model-panel"><div class="panel-heading"><div><p class="section-kicker">按模型查看</p><h2>模型进度</h2></div></div><div id="model-list" class="model-list"></div></section>
+              <section class="panel activity-panel"><div class="panel-heading"><div><p class="section-kicker">生成日志</p><h2>实时动态</h2></div><span id="event-count" class="counter">0</span></div><div id="activity-list" class="activity-list"></div></section>
+            </div>
+            <section class="panel matrix-panel">
+                <div class="panel-heading matrix-heading"><div><p class="section-kicker">题目 × 模型</p><h2>全部生成运行</h2></div><div class="matrix-tools"><input id="task-search" type="search" placeholder="搜索题目…" autocomplete="off" /><select id="status-filter" aria-label="按状态筛选"><option value="">全部状态</option><option value="running">运行中</option><option value="retrying">重试中</option><option value="awaiting_stage">本阶段已完成</option><option value="completed">全部完成</option><option value="failed">失败</option><option value="queued">排队中</option><option value="cancelled">已取消</option></select></div></div>
+              <div class="matrix-wrap"><table id="run-matrix"><thead></thead><tbody></tbody></table><div id="matrix-empty" class="empty-state hidden">没有符合筛选条件的任务</div></div>
+              <button id="load-more" class="load-more hidden">显示更多任务</button>
+            </section>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <aside id="run-drawer" class="drawer" aria-hidden="true">
+      <button id="drawer-backdrop" class="drawer-backdrop" aria-label="关闭详情"></button>
+      <section class="drawer-panel"><header class="drawer-header"><div><p class="section-kicker">单次生成详情</p><h2 id="drawer-title">运行详情</h2></div><button id="drawer-close" class="icon-button" aria-label="关闭">×</button></header><div id="drawer-content" class="drawer-content"></div></section>
+    </aside>
+
+    <dialog id="provider-dialog" class="modal provider-modal">
+      <form method="dialog" class="modal-card">
+        <header><div><p class="section-kicker">统一接入管理</p><h2>供应商与模型</h2><span>全部供应商使用同一套登录、模型选择和接入检查流程。</span></div><button class="icon-button" value="cancel" aria-label="关闭">×</button></header>
+        <div class="provider-modal-body">
+          <div class="provider-manager-toolbar">
+            <label class="provider-search"><span class="visually-hidden">搜索供应商</span><input id="provider-search" type="search" placeholder="搜索供应商、Provider ID 或模型" autocomplete="off" /></label>
+            <div class="provider-manager-actions">
+              <span id="provider-summary">尚未读取 OpenCode</span>
+              <button id="refresh-provider-dialog-button" class="button secondary" type="button">刷新</button>
+              <button id="add-packy-provider-button" class="button primary" type="button">连接 PackyAPI 分组</button>
+            </div>
+          </div>
+          <div class="provider-manager-layout">
+            <nav id="provider-list" class="provider-catalog" aria-label="供应商列表"><div class="empty-state">正在读取 OpenCode 供应商…</div></nav>
+            <section id="provider-detail" class="provider-detail" aria-live="polite"><div class="empty-state">从左侧选择一个供应商。</div></section>
+          </div>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="credential-dialog" class="modal">
+      <form method="dialog" class="modal-card">
+        <header><div><p class="section-kicker">模型登录</p><h2 id="credential-title">连接供应商</h2><span id="credential-subtitle">凭据由 OpenCode 保存在本机。</span></div><button class="icon-button" value="cancel" aria-label="关闭">×</button></header>
+        <div class="modal-body">
+          <div id="credential-current" class="credential-current"></div>
+          <label class="field"><span>API Key</span><div class="secret-input"><input id="api-key-input" type="password" autocomplete="off" placeholder="输入后直接保存，不会写入 Benchmark 数据库" /><button id="toggle-key-button" type="button" class="text-button">显示</button></div></label>
+          <button id="save-api-key-button" type="button" class="button primary full-width">保存到 OpenCode</button>
+          <div id="oauth-section" class="oauth-section hidden"><div class="divider"><span>或使用账号登录</span></div><div id="oauth-methods" class="oauth-methods"></div><div id="oauth-completion" class="oauth-completion hidden"><p id="oauth-instructions"></p><label id="oauth-code-field" class="field hidden"><span>授权码</span><input id="oauth-code-input" type="text" autocomplete="off" /></label><button id="complete-oauth-button" type="button" class="button secondary full-width">我已完成授权</button></div></div>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="packy-dialog" class="modal packy-modal">
+      <form method="dialog" class="modal-card">
+        <header><div><p class="section-kicker">PackyAPI</p><h2 id="packy-dialog-title">连接模型分组</h2><span id="packy-dialog-subtitle">一个分组 Key 会自动接入该分组当前全部游戏生成模型。</span></div><button class="icon-button" value="cancel" aria-label="关闭">×</button></header>
+        <div class="modal-body">
+          <div class="packy-section-heading"><div><strong>选择 Key 所属分组</strong><span>模型来自 PackyAPI 官方实时目录，不需要手填模型 ID。</span></div><a href="https://docs.packyapi.ai/docs/token/2-group.html" target="_blank" rel="noopener">查看分组说明</a></div>
+          <div id="packy-target-model" class="packy-target-model hidden"></div>
+          <label class="field"><span>模型分组</span><select id="packy-group"></select></label>
+          <div id="packy-group-hint" class="packy-group-hint"></div>
+          <div id="packy-model-preview" class="packy-model-preview"></div>
+          <label class="field"><span>该分组的 PackyAPI Key</span><div class="secret-input"><input id="packy-api-key" type="password" autocomplete="off" placeholder="Key 只保存到本机 OpenCode 凭据库" /><button id="toggle-packy-key-button" type="button" class="text-button">显示</button></div></label>
+          <div id="packy-dialog-feedback" class="packy-dialog-feedback hidden" role="status"></div>
+          <button id="save-packy-button" type="button" class="button primary full-width">连接分组并同步全部模型</button>
+          <p class="packy-security-note">密钥不会写入题库、生成配置、运行记录或 SQLite。</p>
+        </div>
+      </form>
+    </dialog>
+
+    <div id="toast" class="toast" role="status"></div>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

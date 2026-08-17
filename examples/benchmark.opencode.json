@@ -1,0 +1,46 @@
+{
+  "version": 1,
+  "name": "Game Generation Benchmark · OpenCode",
+  "dataset": {
+    "dir": "./tasks",
+    "include": []
+  },
+  "models": [
+    { "id": "gpt-5", "model": "openai/gpt-5", "concurrency": 8 },
+    { "id": "claude-sonnet", "model": "anthropic/claude-sonnet-4-5", "concurrency": 8 },
+    { "id": "deepseek-chat", "model": "deepseek/deepseek-chat", "concurrency": 12 },
+    { "id": "kimi-k2", "model": "moonshotai/kimi-k2.5", "concurrency": 12 },
+    { "id": "grok-4", "model": "xai/grok-4", "concurrency": 8 }
+  ],
+  "runtime": {
+    "harness": "opencode",
+    "globalConcurrency": 32,
+    "providerConcurrency": {
+      "openai": 8,
+      "anthropic": 8,
+      "deepseek": 12,
+      "moonshotai": 12,
+      "xai": 8
+    },
+    "workspaceTemplate": "./template",
+    "outputDir": "../runs/opencode",
+    "dataDir": "../.gamebench/opencode",
+    "roundTimeoutMs": 0,
+    "maxAttempts": 3,
+    "retryBackoffMs": 15000
+  },
+  "dashboard": {
+    "hostname": "127.0.0.1",
+    "port": 8787
+  },
+  "opencode": {
+    "hostname": "127.0.0.1",
+    "port": 4096,
+    "startupTimeoutMs": 30000,
+    "agent": "build",
+    "config": {
+      "logLevel": "INFO",
+      "share": "disabled"
+    }
+  }
+}
