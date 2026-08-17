@@ -23,7 +23,7 @@ Game-Gen（界面名称为 **GameBench Studio**）用于批量调用多个模型
 | npm | 随 Node.js 安装；推荐使用仓库中的 `package-lock.json` 执行 `npm ci` |
 | 系统 | Windows 10/11 可直接使用；macOS 和 Linux 也可运行 Node.js 服务 |
 | 浏览器 | Chrome、Edge 或其他现代浏览器 |
-| 网络 | 能访问所选模型供应商；使用 PackyAPI 时需能访问其 API 域名 |
+| 网络 | 能访问你所选择的模型供应商 API |
 | 硬件 | 小批次没有特殊要求；高并发建议至少 16 GB 内存并预留足够磁盘空间 |
 
 OpenCode CLI 和 SDK 已列为项目依赖，执行依赖安装时会一并安装，不需要再单独下载。真实生成还需要你自己的供应商账号、API Key 或 OAuth 登录；仅体验界面和流程时不需要任何 Key。
@@ -148,7 +148,7 @@ npm.cmd start -- serve --port 8787
 
 ### 2. 配置模型和凭据
 
-页面不会预填可能已经过期的模型标识。点击“供应商与模型”后，可以在同一个窗口查看 OpenCode 实际返回的全部 Provider、登录状态和可生成模型；GPT、Claude、DeepSeek、Kimi、Grok、PackyAPI 都使用同一套模型加入和接入检查流程。“刷新接入状态”会重新读取本机 OpenCode，并同步 PackyAPI 官方实时模型目录。
+页面不会预填可能已经过期的模型标识。点击“供应商与模型”后，可以在同一个窗口查看 OpenCode 实际返回的 Provider、登录状态和可生成模型；GPT、Claude、DeepSeek、Kimi、Grok、GLM 等模型都使用同一套加入与接入检查流程。“刷新接入状态”会重新读取本机 OpenCode 和模型目录。
 
 模型标识必须使用 OpenCode 的 `provider/model` 格式。以下仅为格式示例，实际标识以页面同步结果为准：
 
@@ -169,24 +169,11 @@ xai/grok-4
 
 推理强度不会使用一套写死的通用列表，而是按“供应商 + 模型”读取；同名模型通过不同渠道接入时，可选档位也可能不同。页面默认选择“供应商默认”，只有 OpenCode 确认支持的档位才允许选择；固定推理模型会明确标记为不可调整。`max`、`xhigh`、`ultra` 等名称并不保证在所有模型上具有相同含义，请以页面同步结果为准。你的选择会写入实验配置、生成信息、每轮上下文、单次结果和总清单，并在同一游戏的所有轮次保持一致。
 
-#### PackyAPI
+#### 可选：PackyAPI
 
-PackyAPI 在操作台中作为顶层供应商与 OpenAI、Anthropic、DeepSeek 等并列展示，各个 Key 分组放在 PackyAPI 内部管理，不会在主界面散落成多个渠道。平台读取 `https://www.packyapi.ai/api/pricing` 的实时目录，并展示模型、厂商、可用分组和协议能力；图像、审核等不适合生成源码的模型仍可查看，但不能加入游戏生成任务。目录在服务端缓存 5 分钟，也可以在页面手动刷新。
+如需使用，在供应商窗口点击“连接 PackyAPI 分组”，选择 Key 对应的分组并输入 Key 即可。平台会同步这把 Key 可用的源码生成模型，并把已连接模型加入普通模型选择流程。不同分组需要分别连接对应 Key；不使用该供应商时可以完全忽略这一项。
 
-使用时点击“连接 PackyAPI 分组”，选择 API Key 所属分组并输入 Key。无需再填写 Provider ID、Base URL 或模型 ID，平台会：
-
-- 自动同步该分组当前全部游戏生成模型。
-- 保存前通过 PackyAPI 的 `/v1/models` 做零 Token Key 校验；从某个模型发起连接时，会强制确认 Key 包含该目标模型，并自动选择最匹配的分组。
-- 根据模型分组自动选择 OpenAI、Anthropic 或 Google AI SDK 协议，并启用 PackyAPI 要求的 `setCacheKey`。
-- 在后台维护分组对应的 OpenCode Provider；这些底层渠道在操作台里会统一聚合到 PackyAPI，不会作为多个供应商重复展示。
-- 将不含 Key 的 PackyAPI Provider 配置持久化到平台数据目录，并在新增分组后自动重载平台自管的 OpenCode 实例。
-- 把 API Key 保存到 OpenCode 本机凭据库，不写入 Provider 配置。
-- 在主模型下拉中置顶展示 PackyAPI 全部实时模型；未接入模型可从该行直接连接对应分组 Key。
-- 允许逐个选择模型，也可以一键把所有已接入模型加入本次任务。
-
-PackyAPI 的每把 Key 只对应一个模型分组；要同时使用多个分组，需要分别连接对应 Key。可用分组和模型以页面同步到的 PackyAPI 实时目录为准。这个聚合由本框架完成，不需要修改或 fork OpenCode 源码。
-
-API Key 不会写入题库、Benchmark 配置或 SQLite，也不会由网页接口返回。操作台默认只监听 `127.0.0.1`；当面板绑定到非本机地址时，网页密钥管理接口会自动禁用。
+所有通过页面输入的 API Key 都交给本机 OpenCode 凭据库管理，不会写入题库、实验配置或 SQLite，也不会由网页接口返回。操作台默认只监听 `127.0.0.1`；当面板绑定到非本机地址时，网页密钥管理接口会自动禁用。
 
 启动真实任务前，后端还会再次强制校验供应商、模型标识、工具调用能力和凭据状态，避免把无效模型加入运行矩阵。OpenCode 默认端口被占用时，平台会复用健康服务或自动选择可用端口。
 
@@ -328,8 +315,6 @@ npm.cmd run dev -- serve -c examples/benchmark.opencode.json
 | --- | --- | --- |
 | `GAMEBENCH_BASE_URL` | 验收脚本访问操作台的地址 | `http://127.0.0.1:8787` |
 | `GAMEBENCH_OPENCODE_URL` | 全模型冒烟测试访问 OpenCode 的地址 | `http://127.0.0.1:4096` |
-| `PACKY_GROUP` | `verify:all` 临时连接的 PackyAPI 分组 | `codex` |
-| `PACKY_API_KEY` | 仅供 `verify:all` 使用的临时 Key | 无 |
 | `GAMEBENCH_VERIFY_PROVIDERS` | 用正则筛选要测试的供应商 | 全部已连接供应商 |
 | `GAMEBENCH_VERIFY_MODELS` | 用正则筛选要测试的模型 | 全部可工具调用模型 |
 | `GAMEBENCH_VERIFY_EXCLUDE` | 用正则排除供应商或模型 | 无 |
@@ -344,12 +329,6 @@ PowerShell 示例：
 $env:GAMEBENCH_BASE_URL = "http://127.0.0.1:8793"
 npm.cmd run verify:models
 Remove-Item Env:GAMEBENCH_BASE_URL
-```
-
-真实 API Key 使用完应立即从当前终端移除：
-
-```powershell
-Remove-Item Env:PACKY_API_KEY
 ```
 
 ## 数据目录
@@ -393,35 +372,7 @@ npm.cmd run build
 
 自动化测试包含网页控制 API 的完整演练链路，并验证完整题目 × 模型矩阵、同一 Session 的多轮顺序、全局/供应商/单模型三层并发、成功与失败轮次上下文，以及源码结果清单落盘。
 
-### 一键全功能验收
-
-操作台已运行、没有其他活动批次且 PackyAPI 已连接时，可以执行本地测试、类型检查、构建和真实 Token 验收。该命令会实际调用模型并产生费用，不属于日常启动步骤：
-
-```powershell
-$env:GAMEBENCH_BASE_URL = "http://127.0.0.1:8787"
-npm.cmd run verify:all
-```
-
-如果操作台还没有连接 PackyAPI，可只在当前 PowerShell 进程中提供 Key。验收器会通过本机操作台连接分组，不会把 Key 写入报告、题库、实验配置或源码目录：
-
-```powershell
-$env:GAMEBENCH_BASE_URL = "http://127.0.0.1:8787"
-$env:PACKY_GROUP = "codex"
-$env:PACKY_API_KEY = "你的 PackyAPI Key"
-npm.cmd run verify:all
-Remove-Item Env:PACKY_API_KEY
-```
-
-真实验收会运行两层矩阵：
-
-- 两道游戏题分别使用 GPT-5.6 Sol `xhigh`、Terra `high`、Luna `low`，验证 4 并发、多轮 Session、源码和逐轮上下文。
-- 单独使用 GPT-5.6 Sol `max` 跑最小两轮工具用例，避免大型补丁的供应商长连接限制干扰档位接入判断。
-- 自动检查实时 SSE、模型接入状态、OpenCode 快照中的真实 variant、输出目录、`result.json`、全部轮次上下文、`manifest.json`、游戏预览接口和内部路径保护。
-- 遇到最终失败运行时，自动调用控制台的手动重跑接口，最多再重跑三轮，并检查失败 `attempt-N` 产物没有被覆盖。
-
-报告默认保存在 `.gamebench/verification/<时间>/live-packy-report.json`，真实游戏源码仍保存在页面显示的 `runs/<实验 ID>/` 目录。
-
-### 全部连接模型冒烟测试
+### 可选：全部连接模型冒烟测试
 
 需要逐个确认当前 OpenCode 中已连接的模型能否真正调用工具并生成游戏源码时，可运行：
 
