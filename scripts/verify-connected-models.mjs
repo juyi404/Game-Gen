@@ -2,8 +2,8 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { OpenCodeHarness } from "../dist/src/harness/opencode.js";
 
-const dashboardUrl = (process.env.GAMEBENCH_BASE_URL ?? "http://127.0.0.1:8793").replace(/\/+$/u, "");
-const openCodeUrl = (process.env.GAMEBENCH_OPENCODE_URL ?? "http://127.0.0.1:10337").replace(/\/+$/u, "");
+const dashboardUrl = (process.env.GAMEBENCH_BASE_URL ?? "http://127.0.0.1:8787").replace(/\/+$/u, "");
+const openCodeUrl = (process.env.GAMEBENCH_OPENCODE_URL ?? "http://127.0.0.1:4096").replace(/\/+$/u, "");
 const globalConcurrency = positiveInteger(process.env.GAMEBENCH_VERIFY_CONCURRENCY, 12);
 const providerConcurrency = positiveInteger(process.env.GAMEBENCH_VERIFY_PROVIDER_CONCURRENCY, 3);
 const timeoutMs = positiveInteger(process.env.GAMEBENCH_VERIFY_TIMEOUT_MS, 5 * 60 * 1000);

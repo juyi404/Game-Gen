@@ -1,29 +1,91 @@
-# 游戏批量生成台
+# Game-Gen：游戏批量生成操作台
 
-GameBench Studio 是一个只负责“批量生成游戏”的 Benchmark 操作平台。它把题库和模型展开为 `题目 × 模型` 运行矩阵，通过 OpenCode 维持每道题的多轮生成会话，并提供并发调度、失败重试、断点恢复和实时监控。
+Game-Gen（界面名称为 **GameBench Studio**）用于批量调用多个模型生成游戏源码。你上传题库、选择模型并设置并发后，平台会自动展开 `题目 × 模型` 运行矩阵，通过 OpenCode 执行多轮 Prompt，并在网页中持续显示进度、日志、上下文和源码位置。
 
-本项目不实现自动评分、人工评分、质量判断或排行榜；生成产物可交给独立评测系统处理。
+> **项目边界：只负责生成，不负责评测。** 本项目不包含自动评分、人工评分、质量排名或排行榜；生成结果应交给独立的 Benchmark 评测流程。
 
-## 启动操作台
+## 你可以用它完成什么
 
-要求 Node.js 24 或更高版本。
+- 一次上传一个包含 1001 道题的聚合 JSON，或批量上传多个游戏 JSON。
+- 为同一道题配置多轮 Prompt，并选择一次跑完或按阶段逐轮生成。
+- 同时选择 GPT、Claude、DeepSeek、Kimi、Grok、GLM、PackyAPI 等 OpenCode 已接入模型。
+- 分别限制全局、供应商和单模型并发，避免瞬间压垮模型渠道或本机 OpenCode。
+- 在操作台中暂停派发、恢复任务、查看重试原因和每个游戏的实时状态。
+- 按“游戏名称 / 模型 / 尝试次数”保存源码，并单独保存每一轮完整上下文。
+
+## 开始之前
+
+### 环境要求
+
+| 项目 | 要求 |
+| --- | --- |
+| Node.js | `24.0.0` 或更高版本，项目使用了 Node.js 内置 SQLite |
+| npm | 随 Node.js 安装；推荐使用仓库中的 `package-lock.json` 执行 `npm ci` |
+| 系统 | Windows 10/11 可直接使用；macOS 和 Linux 也可运行 Node.js 服务 |
+| 浏览器 | Chrome、Edge 或其他现代浏览器 |
+| 网络 | 能访问所选模型供应商；使用 PackyAPI 时需能访问其 API 域名 |
+| 硬件 | 小批次没有特殊要求；高并发建议至少 16 GB 内存并预留足够磁盘空间 |
+
+OpenCode CLI 和 SDK 已列为项目依赖，执行依赖安装时会一并安装，不需要再单独下载。真实生成还需要你自己的供应商账号、API Key 或 OAuth 登录；仅体验界面和流程时不需要任何 Key。
+
+### 下载、安装和启动
+
+Windows PowerShell 推荐使用以下命令。使用 `npm.cmd` 可以避开部分电脑的 PowerShell 脚本执行策略限制。
 
 ```powershell
-npm.cmd install
-npm.cmd run dev
-```
-
-浏览器打开 `http://127.0.0.1:8787`。生产构建可使用：
-
-```powershell
+git clone https://github.com/XiaoQiangSHI/Game-Gen.git
+cd Game-Gen
+node --version
+npm.cmd ci
 npm.cmd run build
-npm.cmd start
+npm.cmd start -- serve --port 8787
 ```
 
-操作台默认提供两个工作区：
+看到“监控面板”地址后，在浏览器打开 [http://127.0.0.1:8787](http://127.0.0.1:8787)。操作台只监听本机地址，不会默认暴露到局域网或公网。
 
-1. **新建任务**：上传题库、配置模型凭据、设置并发并启动整批生成。
-2. **生成监控**：查看总体进度、模型进度、题目矩阵、日志、源码目录和游戏产物。
+如果 `8787` 已被占用，可以改用其他端口，例如：
+
+```powershell
+npm.cmd start -- serve --port 8793
+```
+
+开发时可跳过构建，直接运行 TypeScript 源码：
+
+```powershell
+npm.cmd run dev -- serve --port 8787
+```
+
+macOS 或 Linux 使用相同命令，将 `npm.cmd` 换成 `npm` 即可。停止前台服务时按 `Ctrl+C`；再次启动会恢复最近一个尚未结束的批次。
+
+更新到仓库最新版本时，先暂停派发、等待正在运行的数量归零，再按 `Ctrl+C` 停止旧后端，然后执行：
+
+```powershell
+git pull --ff-only
+npm.cmd ci
+npm.cmd run build
+npm.cmd start -- serve --port 8787
+```
+
+`.gamebench/` 和 `runs/` 不会被 `git pull` 覆盖；它们仍会保留你的题库、运行状态、上下文和游戏源码。更新前如果有重要批次，仍建议额外备份这两个目录。
+
+### 端口和本地目录
+
+| 用途 | 默认值 | 说明 |
+| --- | --- | --- |
+| 网页操作台 | `127.0.0.1:8787` | 可通过 `--port` 修改 |
+| OpenCode 服务 | `127.0.0.1:4096` | 平台优先复用健康实例，否则自动启动 |
+| 平台状态 | `.gamebench/platform/` | 题库、配置和 SQLite 数据库；不要提交到 Git |
+| 游戏源码 | `runs/<实验 ID>/` | 页面会显示每一批和每个游戏的准确路径 |
+
+正常使用操作台不要求预先设置环境变量，也不需要在项目根目录创建 `config.json`。请在网页中连接模型，或使用 OpenCode CLI 登录。`.env`、`config.json`、`.gamebench/` 和 `runs/` 已被 Git 忽略，但仍不要把真实 Key 写入题库或源码文件。
+
+## 第一次使用建议
+
+1. 先启用“流程演练模式”，确认 JSON 能成功导入且保存目录符合预期。
+2. 连接一个模型，用 1–3 道题完成真实小批次测试。
+3. 正式批量运行时先将全局并发设为 `4`，稳定后再提高到 `8`。
+4. 确认选择了“分阶段生成”，避免一次性执行全部四轮并消耗大量 Token。
+5. 临时停止时使用“暂停派发”；只有确定不再继续该批次时才使用“取消”。
 
 ## 从网页启动一次生成
 
@@ -105,13 +167,11 @@ xai/grok-4
 - 检查供应商是否已经通过 OpenCode CLI、环境变量或网页连接。
 - 按模型选择 OpenCode 实际返回的推理强度；不同模型会分别显示自己的 `none`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`、`ultra` 等可用子集。
 
-推理强度不会使用一套写死的通用列表，而是按“供应商 + 模型”读取；同名模型经不同供应商接入时，可选档位也可能不同。页面默认选择“供应商默认”；只有 OpenCode 确认该模型支持的档位才允许选择。固定推理模型会标记为“固定推理（不可调）”。所选档位会保存到实验配置、源码目录中的生成信息、每轮上下文文件、单次结果和总清单中，并在同一游戏的所有 Prompt 轮次保持一致。
-
-[OpenAI 官方 GPT-5.6 Sol API 模型页](https://developers.openai.com/api/docs/models/gpt-5.6-sol)说明其 `reasoning.effort` 支持 `none`、`low`、`medium`、`high`、`xhigh`、`max`。[Codex 模型说明](https://learn.chatgpt.com/docs/models)中的 `ultra` 是会启用子代理的执行模式，不是模型 API 的推理强度。因此 PackyAPI/OpenAI 路径不会被强行添加一个无效的 `ultra`；GPT-5.6 Sol/Terra 的下拉框旁会明确显示这条边界提示。如果以后 OpenCode 为某个模型真实返回 `ultra` variant，操作台会自动把它显示为可选档位并透传。
+推理强度不会使用一套写死的通用列表，而是按“供应商 + 模型”读取；同名模型通过不同渠道接入时，可选档位也可能不同。页面默认选择“供应商默认”，只有 OpenCode 确认支持的档位才允许选择；固定推理模型会明确标记为不可调整。`max`、`xhigh`、`ultra` 等名称并不保证在所有模型上具有相同含义，请以页面同步结果为准。你的选择会写入实验配置、生成信息、每轮上下文、单次结果和总清单，并在同一游戏的所有轮次保持一致。
 
 #### PackyAPI
 
-PackyAPI 在操作台中只显示为一个独立供应商，与 OpenAI、Anthropic、DeepSeek 等供应商同级。平台读取 `https://www.packyapi.ai/api/pricing` 的官方实时目录，并展示全部模型、厂商、可用分组和协议能力；图像、审核等不适合生成源码的模型仍会显示，但不会允许加入游戏生成任务。目录在服务端缓存 5 分钟，也可以在页面手动刷新。
+PackyAPI 在操作台中作为顶层供应商与 OpenAI、Anthropic、DeepSeek 等并列展示，各个 Key 分组放在 PackyAPI 内部管理，不会在主界面散落成多个渠道。平台读取 `https://www.packyapi.ai/api/pricing` 的实时目录，并展示模型、厂商、可用分组和协议能力；图像、审核等不适合生成源码的模型仍可查看，但不能加入游戏生成任务。目录在服务端缓存 5 分钟，也可以在页面手动刷新。
 
 使用时点击“连接 PackyAPI 分组”，选择 API Key 所属分组并输入 Key。无需再填写 Provider ID、Base URL 或模型 ID，平台会：
 
@@ -153,7 +213,9 @@ npx.cmd opencode models
 有效并发 = min(全局剩余, 供应商剩余, 单模型剩余)
 ```
 
-建议先用 2–8 的全局并发跑一个小批次，再根据各供应商 RPM、TPM、账号额度以及本机 CPU、内存、磁盘和网络压力逐步提高。高并发不仅消耗 API 配额，OpenCode 的工具调用、依赖安装和游戏构建也会占用本机资源。
+对于单机运行，推荐从全局并发 `4` 开始，确认稳定后再提高到 `8`。不要仅因为有两个模型就把全局并发设为两者上限之和：例如两个模型各设为 `6`、全局设为 `8` 时，整机同时最多仍是 `8` 个任务。是否继续提高应同时参考供应商 RPM/TPM、账号额度，以及本机 CPU、内存、磁盘和网络压力。
+
+一次性设置 `32` 路或更高并发会让单个 OpenCode 进程同时维护大量会话、事件流和工具调用，可能造成连接中断和集中重试。框架会对 `fetch failed`、证书错误、`429` 和供应商 `5xx` 等基础设施故障启动全局熔断：停止派发至少 60 秒，恢复时只放一个探针任务，并且不消耗正常生成尝试额度。但熔断是故障保护，不代表高并发本身没有成本。
 
 ### 4. 分阶段生成
 
@@ -162,7 +224,7 @@ npx.cmd opencode models
 1. 首次点击“开始批量生成”只执行全部“题目 × 模型”的第 1 轮。
 2. 本阶段全部成功后，任务进入“本阶段已完成”，不会自动消耗下一轮 Token。
 3. 在监控页点击“开始第 2 阶段”，平台才会执行第 2 轮；后续阶段相同。
-4. 每个运行始终沿用相同的运行 ID、`attempt-1` 源码目录、OpenCode `sessionId` 和已保存的历史上下文。
+4. 每个运行始终沿用相同的运行 ID、当前成功的 `attempt-N` 源码目录、OpenCode `sessionId` 和已保存的历史上下文；如果前一阶段发生正式重试，则后续阶段会继续使用成功的新尝试目录。
 
 阶段之间可以关闭操作台，稍后重新启动后继续。若当前阶段有失败项，需要先重试失败项；全部运行到达当前阶段边界后才能启动下一阶段。关闭“分阶段生成”后，行为与旧版本一致，会在同一次运行中连续执行全部 Prompt。
 
@@ -176,7 +238,7 @@ npx.cmd opencode models
 
 点击“开始批量生成”后，平台会创建完整运行矩阵并立即派发。监控页支持：
 
-- 暂停派发新任务、继续运行、取消整批任务。
+- 暂停派发新任务、继续运行，或永久取消整批任务。
 - 按模型和题目查看实时进度。
 - 查看每轮 Prompt、模型响应、OpenCode 工具事件和错误。
 - 查看并复制每一轮独立上下文 JSON 的保存路径。
@@ -184,7 +246,30 @@ npx.cmd opencode models
 - 重跑失败项。
 - 打开生成的静态游戏或复制本次源码目录。
 
-进程被关闭后，重新执行 `npm.cmd run dev` 会恢复最近一个未完成任务。暂停只停止派发新运行，不会强制中止当前正在生成的运行。
+进程被关闭后，重新执行启动命令会恢复最近一个未完成任务。**暂停**只停止派发新运行，已经在生成的任务会继续完成；**取消**会终止整个批次并把排队项标记为已取消，不能再通过“继续运行”恢复。需要暂时停下来时请使用“暂停”，不要使用“取消”。
+
+## 常见问题
+
+### 为什么降低并发后仍可能出现重试？
+
+重试不一定代表并发失控。打开任务详情可以看到准确错误，常见情况分为两类：
+
+- **基础设施故障**：例如 `fetch failed`、连接被拒绝、证书错误、`429` 或供应商 `5xx`。框架会熔断整批派发、等待恢复并只运行一个探针；这类故障不会扣减正常生成尝试额度。
+- **生成结果无效**：模型正常结束但没有写文件、`index.html` 仍是占位页、缺少可运行脚本，或供应商返回 `0 token / finish=unknown` 的空结束。框架必须重新生成，否则保存下来的只是空白或不可玩的游戏。
+
+因此平台无法承诺绝对零重试；它能保证的是限制重试范围、保留失败现场、避免基础设施故障形成重试风暴，并且不会把无效占位页当作成功游戏。某个任务显示“等待重试”时，如果全局并发已经占满，它会等到有空位后优先重新执行，并不是卡死。
+
+### API Key 保存在哪里？
+
+通过页面输入的 Key 交给本机 OpenCode 凭据库管理，不写入题库、实验配置、SQLite、游戏源码或 Git 仓库。不要把真实 Key 放进 `config.json`、`.env`、Prompt JSON、README、截图或聊天内容；如果 Key 曾以明文出现在这些位置，建议到供应商后台轮换。
+
+### 游戏和每轮上下文保存在哪里？
+
+启动页和监控页都会显示绝对路径。默认源码根目录是 `runs/<实验 ID>/`，每个游戏的每个模型都有独立目录；多轮 Prompt 继续修改同一份源码，每轮完整上下文分别保存在 `.benchmark/round-contexts/`。
+
+### 关闭浏览器会停止生成吗？
+
+不会。生成由本机 Node.js 后端执行，关闭网页只会停止查看界面。关闭终端或结束后端进程才会中断服务；重新启动后端时，平台会从数据库恢复最近的未完成批次。
 
 ## 不花费 API 额度的流程测试
 
@@ -215,25 +300,57 @@ npm.cmd run dev -- serve -c examples/benchmark.opencode.json
   "name": "My Game Benchmark",
   "dataset": { "dir": "./tasks", "include": [] },
   "models": [
-    { "id": "gpt-high", "model": "openai/gpt-5", "reasoningEffort": "high", "concurrency": 8 },
-    { "id": "claude", "model": "anthropic/claude-sonnet-4-5", "concurrency": 8 }
+    { "id": "gpt-high", "model": "openai/gpt-5", "reasoningEffort": "high", "concurrency": 4 },
+    { "id": "claude", "model": "anthropic/claude-sonnet-4-5", "concurrency": 4 }
   ],
   "runtime": {
     "harness": "opencode",
     "stageMode": "all",
-    "globalConcurrency": 16,
-    "providerConcurrency": { "openai": 8, "anthropic": 8 },
+    "globalConcurrency": 8,
+    "providerConcurrency": { "openai": 4, "anthropic": 4 },
     "workspaceTemplate": "./template",
     "outputDir": "../runs",
     "dataDir": "../.gamebench",
     "roundTimeoutMs": 0,
     "maxAttempts": 3,
-    "retryBackoffMs": 15000
+    "retryBackoffMs": 60000
   }
 }
 ```
 
 `roundTimeoutMs` 固定归一为 `0`，表示每轮不限时。框架不会因为生成耗时而终止模型；仅在模型正常完成、供应商返回错误、用户主动取消或操作台关闭时结束当前调用。
+
+## 可选环境变量
+
+日常通过网页生成游戏时没有必填环境变量。以下变量只用于仓库自带的验收脚本，建议仅在当前终端临时设置：
+
+| 变量 | 用途 | 默认值 |
+| --- | --- | --- |
+| `GAMEBENCH_BASE_URL` | 验收脚本访问操作台的地址 | `http://127.0.0.1:8787` |
+| `GAMEBENCH_OPENCODE_URL` | 全模型冒烟测试访问 OpenCode 的地址 | `http://127.0.0.1:4096` |
+| `PACKY_GROUP` | `verify:all` 临时连接的 PackyAPI 分组 | `codex` |
+| `PACKY_API_KEY` | 仅供 `verify:all` 使用的临时 Key | 无 |
+| `GAMEBENCH_VERIFY_PROVIDERS` | 用正则筛选要测试的供应商 | 全部已连接供应商 |
+| `GAMEBENCH_VERIFY_MODELS` | 用正则筛选要测试的模型 | 全部可工具调用模型 |
+| `GAMEBENCH_VERIFY_EXCLUDE` | 用正则排除供应商或模型 | 无 |
+| `GAMEBENCH_VERIFY_CONCURRENCY` | 全模型冒烟测试的总并发 | `12` |
+| `GAMEBENCH_VERIFY_PROVIDER_CONCURRENCY` | 冒烟测试的单供应商并发 | `3` |
+| `GAMEBENCH_VERIFY_TIMEOUT_MS` | 单模型冒烟测试超时 | `300000` |
+| `GAMEBENCH_VERIFY_REASONING_EFFORT` | 强制使用指定推理强度 | 按模型自动选择 |
+
+PowerShell 示例：
+
+```powershell
+$env:GAMEBENCH_BASE_URL = "http://127.0.0.1:8793"
+npm.cmd run verify:models
+Remove-Item Env:GAMEBENCH_BASE_URL
+```
+
+真实 API Key 使用完应立即从当前终端移除：
+
+```powershell
+Remove-Item Env:PACKY_API_KEY
+```
 
 ## 数据目录
 
@@ -245,7 +362,7 @@ npm.cmd run dev -- serve -c examples/benchmark.opencode.json
   datasets/<dataset-id>/
   configs/<generated-config>.json
 
-runs/<task-batch-id>/
+runs/<experiment-id>/
   manifest.json                         整批运行结果清单
   <game-name>/                           使用题目中的游戏名称，支持中文
     <model-id>/attempt-N/                同一次尝试的全部 Prompt 轮次共用此源码目录
@@ -278,7 +395,7 @@ npm.cmd run build
 
 ### 一键全功能验收
 
-操作台已运行且 PackyAPI 已连接时，可以执行本地测试、类型检查、构建和真实 Token 验收：
+操作台已运行、没有其他活动批次且 PackyAPI 已连接时，可以执行本地测试、类型检查、构建和真实 Token 验收。该命令会实际调用模型并产生费用，不属于日常启动步骤：
 
 ```powershell
 $env:GAMEBENCH_BASE_URL = "http://127.0.0.1:8787"
@@ -309,9 +426,9 @@ Remove-Item Env:PACKY_API_KEY
 需要逐个确认当前 OpenCode 中已连接的模型能否真正调用工具并生成游戏源码时，可运行：
 
 ```powershell
-$env:GAMEBENCH_BASE_URL = "http://127.0.0.1:8793"
-$env:GAMEBENCH_OPENCODE_URL = "http://127.0.0.1:10337"
+$env:GAMEBENCH_BASE_URL = "http://127.0.0.1:8787"
+$env:GAMEBENCH_OPENCODE_URL = "http://127.0.0.1:4096"
 npm.cmd run verify:models
 ```
 
-测试器会为每个可工具调用模型创建隔离会话和目录，要求模型实际修改 `index.html`，并检查可玩脚本与连接标记。可通过 `GAMEBENCH_VERIFY_PROVIDERS`、`GAMEBENCH_VERIFY_MODELS`、`GAMEBENCH_VERIFY_EXCLUDE`、`GAMEBENCH_VERIFY_CONCURRENCY`、`GAMEBENCH_VERIFY_PROVIDER_CONCURRENCY`、`GAMEBENCH_VERIFY_TIMEOUT_MS` 和 `GAMEBENCH_VERIFY_REASONING_EFFORT` 缩小范围或调整并发。报告、会话上下文和测试源码保存在 `.gamebench/verification/connected-models-<时间>/`，不会混入正式 `runs/` 目录。
+测试器会为每个可工具调用模型创建隔离会话和目录，要求模型实际修改 `index.html`，并检查可玩脚本与连接标记。它会消耗真实 Token 并增加 OpenCode 负载，不建议与正式批量生成同时运行。可通过 `GAMEBENCH_VERIFY_PROVIDERS`、`GAMEBENCH_VERIFY_MODELS`、`GAMEBENCH_VERIFY_EXCLUDE`、`GAMEBENCH_VERIFY_CONCURRENCY`、`GAMEBENCH_VERIFY_PROVIDER_CONCURRENCY`、`GAMEBENCH_VERIFY_TIMEOUT_MS` 和 `GAMEBENCH_VERIFY_REASONING_EFFORT` 缩小范围或调整并发。报告、会话上下文和测试源码保存在 `.gamebench/verification/connected-models-<时间>/`，不会混入正式 `runs/` 目录。

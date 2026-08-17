@@ -6,28 +6,28 @@
     "include": []
   },
   "models": [
-    { "id": "gpt-5", "model": "openai/gpt-5", "concurrency": 8 },
-    { "id": "claude-sonnet", "model": "anthropic/claude-sonnet-4-5", "concurrency": 8 },
-    { "id": "deepseek-chat", "model": "deepseek/deepseek-chat", "concurrency": 12 },
-    { "id": "kimi-k2", "model": "moonshotai/kimi-k2.5", "concurrency": 12 },
-    { "id": "grok-4", "model": "xai/grok-4", "concurrency": 8 }
+    { "id": "gpt-5", "model": "openai/gpt-5", "concurrency": 4 },
+    { "id": "claude-sonnet", "model": "anthropic/claude-sonnet-4-5", "concurrency": 4 },
+    { "id": "deepseek-chat", "model": "deepseek/deepseek-chat", "concurrency": 4 },
+    { "id": "kimi-k2", "model": "moonshotai/kimi-k2.5", "concurrency": 4 },
+    { "id": "grok-4", "model": "xai/grok-4", "concurrency": 4 }
   ],
   "runtime": {
     "harness": "opencode",
-    "globalConcurrency": 32,
+    "globalConcurrency": 8,
     "providerConcurrency": {
-      "openai": 8,
-      "anthropic": 8,
-      "deepseek": 12,
-      "moonshotai": 12,
-      "xai": 8
+      "openai": 4,
+      "anthropic": 4,
+      "deepseek": 4,
+      "moonshotai": 4,
+      "xai": 4
     },
     "workspaceTemplate": "./template",
     "outputDir": "../runs/opencode",
     "dataDir": "../.gamebench/opencode",
     "roundTimeoutMs": 0,
     "maxAttempts": 3,
-    "retryBackoffMs": 15000
+    "retryBackoffMs": 60000
   },
   "dashboard": {
     "hostname": "127.0.0.1",
