@@ -26,6 +26,20 @@ export type StageMode = "all" | "manual";
 export type RoundStatus = "pending" | "running" | "completed" | "failed";
 export type EventLevel = "debug" | "info" | "warn" | "error";
 
+export interface PackyBillingSnapshot {
+  provider: "packy";
+  group: string;
+  catalogSource: string;
+  catalogFetchedAt: number;
+  pricing: {
+    quotaType?: number | string;
+    modelRatio?: number | string;
+    modelPrice?: number | string;
+    completionRatio?: number | string;
+    tiers?: unknown;
+  };
+}
+
 export interface ModelConfig {
   id: string;
   model: string;
@@ -36,6 +50,7 @@ export interface ModelConfig {
   reasoningEffort?: string;
   agent?: string;
   systemPrompt?: string;
+  billingSnapshot?: PackyBillingSnapshot;
 }
 
 export interface RoundDefinition {
@@ -62,6 +77,7 @@ export interface RuntimeConfig {
   outputDir: string;
   dataDir: string;
   roundTimeoutMs: number;
+  roundIdleTimeoutMs: number;
   maxAttempts: number;
   retryBackoffMs: number;
   workspaceTemplate?: string;
@@ -129,6 +145,7 @@ export interface RunRecord {
   totalRounds: number;
   attempt: number;
   maxAttempts: number;
+  resumePending: boolean;
   availableAt: number;
   workspacePath: string | null;
   sessionId: string | null;
@@ -137,6 +154,35 @@ export interface RunRecord {
   startedAt: number | null;
   completedAt: number | null;
   updatedAt: number;
+}
+
+export interface RunListRecord extends RunRecord {
+  completedRounds: number;
+}
+
+export interface RunPage {
+  runs: RunListRecord[];
+  page: number;
+  pageSize: number;
+  totalTasks: number;
+  totalPages: number;
+  hasNextPage: boolean;
+}
+
+export interface ModelRunSummary {
+  modelId: string;
+  providerId: string;
+  total: number;
+  queued: number;
+  preparing: number;
+  running: number;
+  retrying: number;
+  awaitingStage: number;
+  completed: number;
+  failed: number;
+  cancelled: number;
+  completedRounds: number;
+  totalRounds: number;
 }
 
 export interface RoundRecord {
@@ -196,14 +242,18 @@ export interface HarnessRunContext {
   ) => void;
 }
 
+export interface HarnessUsage {
+  input: number;
+  output: number;
+  reasoning: number;
+  cacheRead: number;
+  cacheWrite: number;
+  cost: number;
+}
+
 export interface HarnessRoundResult {
   response: string;
-  usage?: {
-    input: number;
-    output: number;
-    reasoning: number;
-    cost: number;
-  };
+  usage?: HarnessUsage;
 }
 
 export interface GenerationHarness {

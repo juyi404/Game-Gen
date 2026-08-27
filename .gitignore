@@ -5,6 +5,7 @@ runs/
 examples/output/
 examples/.data/
 coverage/
+.deploy/
 *.log
 .env
 .env.*

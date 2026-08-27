@@ -42,7 +42,7 @@ describe("benchmark config", () => {
     }
   });
 
-  it("normalizes legacy round timeouts to unlimited", async () => {
+  it("preserves hard and idle round timeouts", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "gamebench-unlimited-"));
     const tasksDirectory = path.join(directory, "tasks");
     try {
@@ -61,8 +61,9 @@ describe("benchmark config", () => {
       }));
 
       const { config, tasks } = await loadBenchmarkConfig(configPath);
-      expect(config.runtime.roundTimeoutMs).toBe(0);
-      expect(tasks[0]?.rounds[0]?.timeoutMs).toBe(0);
+      expect(config.runtime.roundTimeoutMs).toBe(1_800_000);
+      expect(config.runtime.roundIdleTimeoutMs).toBe(30 * 60 * 1000);
+      expect(tasks[0]?.rounds[0]?.timeoutMs).toBe(60_000);
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
@@ -77,6 +78,50 @@ describe("benchmark config", () => {
         games: [aggregateTask("game-0001", "First game")],
       }));
       await expect(loadTasks(directory)).rejects.toThrow("count 必须等于 games 数组长度");
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("only resolves promptFile and seedDir references inside the dataset root", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "gamebench-references-"));
+    const directory = path.join(root, "dataset");
+    const taskDirectory = path.join(directory, "games");
+    try {
+      await mkdir(taskDirectory, { recursive: true });
+      await mkdir(path.join(directory, "seed"));
+      await writeFile(path.join(directory, "prompt.txt"), "Build the safe game");
+      await writeFile(path.join(root, "secret.txt"), "server secret");
+      await writeFile(path.join(taskDirectory, "safe.json"), JSON.stringify({
+        id: "safe-game",
+        seedDir: "../seed",
+        rounds: [{ promptFile: "../prompt.txt" }],
+      }));
+
+      const tasks = await loadTasks(directory);
+      expect(tasks[0]?.rounds[0]?.prompt).toBe("Build the safe game");
+      expect(tasks[0]?.seedDir).toBe(path.join(directory, "seed"));
+
+      await writeFile(path.join(taskDirectory, "safe.json"), JSON.stringify({
+        id: "unsafe-game",
+        rounds: [{ promptFile: "../../secret.txt" }],
+      }));
+      await expect(loadTasks(directory)).rejects.toThrow("必须位于题库目录内");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("forbids external file references for web-uploaded datasets", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "gamebench-web-references-"));
+    try {
+      await writeFile(path.join(directory, "prompt.txt"), "Prompt stored beside task");
+      await writeFile(path.join(directory, "game.json"), JSON.stringify({
+        id: "web-game",
+        rounds: [{ promptFile: "prompt.txt" }],
+      }));
+      await expect(loadTasks(directory, [], { references: "forbid" }))
+        .rejects.toThrow("网页上传题库不允许使用 promptFile");
     } finally {
       await rm(directory, { recursive: true, force: true });
     }

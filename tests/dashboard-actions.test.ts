@@ -1,15 +1,21 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { ControlPlane } from "../src/control-plane.js";
 import { BenchmarkDatabase } from "../src/database.js";
 import { OrchestratorManager } from "../src/manager.js";
+import type {
+  AggregatorProviderConfiguration,
+  AggregatorProviderSummary,
+} from "../src/opencode-service.js";
 import { DashboardServer } from "../src/server/dashboard.js";
 
 const temporaryDirectories: string[] = [];
+const csrfTokens = new Map<string, string>();
 
 afterEach(async () => {
+  csrfTokens.clear();
   await Promise.all(
     temporaryDirectories.splice(0).map((directory) =>
       rm(directory, { recursive: true, force: true }),
@@ -117,6 +123,17 @@ describe("dashboard lifecycle actions", () => {
         `/api/experiments/${experiment.id}`,
       );
       expect(cancelled.summary.cancelled).toBeGreaterThan(0);
+      const paged = await getJson<{
+        runs: unknown[];
+        runPage: { page: number; pageSize: number; totalTasks: number; totalPages: number };
+        modelSummaries: Array<{ modelId: string; total: number }>;
+      }>(fixture.url, `/api/experiments/${experiment.id}?page=2&pageSize=5`);
+      expect(paged.runPage).toMatchObject({ page: 2, pageSize: 5, totalTasks: 12, totalPages: 3 });
+      expect(paged.runs).toHaveLength(5);
+      expect(paged.modelSummaries).toEqual([
+        expect.objectContaining({ modelId: "mock-high", total: 12 }),
+      ]);
+      expect((await fetch(`${fixture.url}/api/experiments/${experiment.id}?pageSize=201`)).status).toBe(400);
       await waitFor(async () => {
         const current = JSON.parse(await readFile(experiment.manifestPath, "utf8")) as {
           status: string;
@@ -158,9 +175,47 @@ describe("dashboard lifecycle actions", () => {
       const artifactResponse = await fetch(`${fixture.url}/artifacts/${retryRun.id}/`);
       expect(artifactResponse.status).toBe(200);
       expect(await artifactResponse.text()).toContain("Lifecycle game");
+    expect(artifactResponse.headers.get("content-security-policy")).toContain("sandbox allow-scripts allow-pointer-lock");
+      expect(artifactResponse.headers.get("content-security-policy")).toContain("connect-src 'none'");
+      expect(artifactResponse.headers.get("access-control-allow-origin")).toBe("*");
       expect((await fetch(
         `${fixture.url}/artifacts/${retryRun.id}/.benchmark/result.json`,
       )).status).toBe(403);
+
+      for (let index = 0; index < 1_005; index += 1) {
+        fixture.db.appendEvent(
+          experiment.id,
+          retryRun.id,
+          "test.log",
+          "debug",
+          `log-${index}`,
+        );
+      }
+      const newestLogs = await getJson<{
+        events: Array<{ message: string }>;
+        eventPage: { limit: number; hasMore: boolean };
+      }>(fixture.url, `/api/runs/${retryRun.id}`);
+      expect(newestLogs.events).toHaveLength(1_000);
+      expect(newestLogs.events[0]?.message).toBe("log-5");
+      expect(newestLogs.events.at(-1)?.message).toBe("log-1004");
+      expect(newestLogs.eventPage).toEqual({
+        limit: 1_000,
+        hasMore: true,
+        oldestEventId: expect.any(Number),
+        newestEventId: expect.any(Number),
+      });
+
+      const outsideArtifact = path.join(fixture.directory, "outside-artifact.txt");
+      await writeFile(outsideArtifact, "server secret", "utf8");
+      const linkedArtifact = path.join(runDetail.run.workspacePath, "linked-secret.txt");
+      try {
+        await symlink(outsideArtifact, linkedArtifact, "file");
+        expect((await fetch(
+          `${fixture.url}/artifacts/${retryRun.id}/linked-secret.txt`,
+        )).status).not.toBe(200);
+      } catch (error) {
+        if (!(error instanceof Error) || !("code" in error) || error.code !== "EPERM") throw error;
+      }
       expect((await fetch(`${fixture.url}/app.js`)).status).toBe(200);
       expect((await fetch(`${fixture.url}/styles.css`)).status).toBe(200);
       expect((await fetch(`${fixture.url}/api/stream?experimentId=missing`)).status).toBe(400);
@@ -294,14 +349,20 @@ describe("dashboard lifecycle actions", () => {
     try {
       const wrongContentType = await fetch(`${fixture.url}/api/datasets/import`, {
         method: "POST",
-        headers: { "Content-Type": "text/plain" },
+        headers: {
+          "Content-Type": "text/plain",
+          "X-GameBench-CSRF": await csrfToken(fixture.url),
+        },
         body: "{}",
       });
       expect(wrongContentType.status).toBe(415);
 
       const malformed = await fetch(`${fixture.url}/api/datasets/import`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "X-GameBench-CSRF": await csrfToken(fixture.url),
+        },
         body: "{",
       });
       expect(malformed.status).toBe(400);
@@ -364,9 +425,44 @@ describe("dashboard lifecycle actions", () => {
         providerId: "vendor-a",
         key: "must-not-be-written",
       });
-      expect(response.response.status).toBe(400);
+      expect(response.response.status).toBe(403);
       expect(response.body).toMatchObject({ error: expect.stringContaining("只允许") });
       expect(fixture.calls.apiKeys).toEqual([]);
+      const aggregatorResponse = await postJson(
+        fixture.url,
+        "/api/providers/aggregators/connect",
+        {
+          baseUrl: "https://gateway.example.com/v1",
+          apiKey: "must-not-be-sent",
+        },
+      );
+      expect(aggregatorResponse.response.status).toBe(403);
+      expect(fixture.calls.aggregatorDiscoveries).toEqual([]);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("rejects missing or cross-origin CSRF credentials for every write route", async () => {
+    const fixture = await createFixture();
+    try {
+      const missing = await fetch(`${fixture.url}/api/datasets/import`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: "blocked", files: [] }),
+      });
+      expect(missing.status).toBe(403);
+
+      const crossOrigin = await fetch(`${fixture.url}/api/datasets/import`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Origin": "https://attacker.example",
+          "X-GameBench-CSRF": await csrfToken(fixture.url),
+        },
+        body: JSON.stringify({ name: "blocked", files: [] }),
+      });
+      expect(crossOrigin.status).toBe(403);
     } finally {
       await fixture.close();
     }
@@ -410,6 +506,7 @@ async function createFixture(hostname = "127.0.0.1") {
   const calls = {
     apiKeys: [] as Array<{ providerId: string; key: string }>,
     oauth: [] as Array<Record<string, unknown>>,
+    aggregatorDiscoveries: [] as Array<{ baseUrl: string; apiKey: string }>,
   };
   const providerGateway = {
     expectedUrl: "http://127.0.0.1:4096",
@@ -441,6 +538,40 @@ async function createFixture(hostname = "127.0.0.1") {
     },
     async listPackyAuthorizedModels() { return ["game-model"]; },
     async configurePackyProvider() { throw new Error("not used"); },
+    async listAggregatorProviders() { return [] as AggregatorProviderSummary[]; },
+    async discoverAggregatorModels(baseUrl: string, apiKey: string) {
+      calls.aggregatorDiscoveries.push({ baseUrl, apiKey });
+      return {
+        models: [{ id: "game-model", name: "Game Model" }],
+        discoveredModelCount: 1,
+        rejectedModelCount: 0,
+      };
+    },
+    async configureAggregatorProvider(input: AggregatorProviderConfiguration) {
+      return {
+        providerId: input.providerId,
+        name: input.name,
+        baseUrl: input.baseUrl,
+        connected: true,
+        models: input.models.map((model) => ({ ...model, toolCall: true })),
+      } satisfies AggregatorProviderSummary;
+    },
+    async listModelVerifications() { return []; },
+    async verifyModels(requests: Array<{ providerId: string; modelId: string }>) {
+      return requests.map((request) => ({
+        ...request,
+        ready: true,
+        cached: false,
+        error: "",
+        record: {
+          ...request,
+          verifiedAt: Date.now(),
+          expiresAt: Date.now() + 60_000,
+          method: "opencode" as const,
+          latencyMs: 1,
+        },
+      }));
+    },
     async setApiKey(providerId: string, key: string) {
       calls.apiKeys.push({ providerId, key });
     },
@@ -518,13 +649,26 @@ function taskJson(id: string, rounds: number): string {
 async function postJson(url: string, pathname: string, body: unknown) {
   const response = await fetch(`${url}${pathname}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      "X-GameBench-CSRF": await csrfToken(url),
+    },
     body: JSON.stringify(body),
   });
   return {
     response,
     body: await response.json() as unknown,
   };
+}
+
+async function csrfToken(url: string): Promise<string> {
+  const cached = csrfTokens.get(url);
+  if (cached) return cached;
+  const response = await fetch(`${url}/api/setup`);
+  const setup = await response.json() as { csrfToken?: string };
+  if (!setup.csrfToken) throw new Error("dashboard did not issue a CSRF token");
+  csrfTokens.set(url, setup.csrfToken);
+  return setup.csrfToken;
 }
 
 async function getJson<T>(url: string, pathname: string): Promise<T> {

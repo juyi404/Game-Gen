@@ -26,6 +26,7 @@
     "outputDir": "../runs/mock",
     "dataDir": "../.gamebench/mock",
     "roundTimeoutMs": 0,
+    "roundIdleTimeoutMs": 1800000,
     "maxAttempts": 2,
     "retryBackoffMs": 500
   },

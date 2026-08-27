@@ -27,5 +27,9 @@
     "tsx": "^4.20.0",
     "typescript": "^5.9.0",
     "vitest": "^3.2.0"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true,
+    "opencode-ai@1.18.18": true
   }
 }

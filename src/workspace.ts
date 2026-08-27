@@ -37,7 +37,7 @@ export async function prepareWorkspace(
   tasks: Iterable<TaskDefinition> = [task],
 ): Promise<string> {
   const outputRoot = experimentOutputDir(config, experiment.id);
-  if (run.workspacePath && run.sessionId && run.currentRound > 0) {
+  if (run.workspacePath && (run.sessionId || run.resumePending)) {
     const existingWorkspace = path.resolve(run.workspacePath);
     const relative = path.relative(outputRoot, existingWorkspace);
     if (relative.startsWith("..") || path.isAbsolute(relative)) {
@@ -190,8 +190,9 @@ export async function writeRoundContext(input: RoundContextWriteInput): Promise<
       number: input.roundRecord.roundIndex + 1,
       id: input.roundRecord.roundId,
       status: input.roundRecord.status,
-      timeoutMs: null,
-      unlimited: true,
+      timeoutMs: (input.round.timeoutMs ?? input.config.runtime.roundTimeoutMs) || null,
+      idleTimeoutMs: input.config.runtime.roundIdleTimeoutMs || null,
+      unlimited: (input.round.timeoutMs ?? input.config.runtime.roundTimeoutMs) <= 0,
       startedAt: toIsoString(input.roundRecord.startedAt),
       completedAt: toIsoString(input.roundRecord.completedAt),
       error: input.roundRecord.error,

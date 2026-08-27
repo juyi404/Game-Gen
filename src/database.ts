@@ -9,11 +9,14 @@ import type {
   ExperimentStatus,
   ExperimentSummary,
   GenerationEvent,
+  HarnessUsage,
+  ModelRunSummary,
   ResolvedBenchmarkConfig,
   RoundRecord,
   RoundSummary,
   RoundStatus,
   RunRecord,
+  RunPage,
   RunStatus,
   StageMode,
   TaskDefinition,
@@ -21,16 +24,51 @@ import type {
 
 type DbRow = Record<string, unknown>;
 
+const DEFAULT_EVENT_RETENTION_PER_EXPERIMENT = 200_000;
+const DEFAULT_EVENT_RETENTION_GLOBAL = 1_000_000;
+const EVENT_PRUNE_INTERVAL = 1_000;
+const DEFAULT_EVENT_DATA_MAX_BYTES = 128 * 1024;
+
+export interface EventPage {
+  events: GenerationEvent[];
+  hasMore: boolean;
+}
+
+export interface InfrastructureRetryState {
+  attempts: number;
+  firstFailedAt: number | null;
+}
+
+export interface UsageSummary extends HarnessUsage {
+  rounds: number;
+}
+
 export class BenchmarkDatabase extends EventEmitter {
   readonly filePath: string;
   private readonly db: DatabaseSync;
+  private readonly eventRetentionPerExperiment: number;
+  private readonly eventRetentionGlobal: number;
+  private readonly eventDataMaxBytes: number;
+  private eventsSincePrune = 0;
 
   constructor(filePath: string) {
     super();
     this.filePath = resolve(filePath);
     mkdirSync(dirname(this.filePath), { recursive: true });
     this.db = new DatabaseSync(this.filePath);
-    this.db.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;");
+    this.db.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
+    this.eventRetentionPerExperiment = positiveIntegerEnvironment(
+      "GAMEBENCH_EVENT_RETENTION_PER_EXPERIMENT",
+      DEFAULT_EVENT_RETENTION_PER_EXPERIMENT,
+    );
+    this.eventRetentionGlobal = positiveIntegerEnvironment(
+      "GAMEBENCH_EVENT_RETENTION_GLOBAL",
+      DEFAULT_EVENT_RETENTION_GLOBAL,
+    );
+    this.eventDataMaxBytes = positiveIntegerEnvironment(
+      "GAMEBENCH_EVENT_DATA_MAX_BYTES",
+      DEFAULT_EVENT_DATA_MAX_BYTES,
+    );
     this.migrate();
   }
 
@@ -139,7 +177,7 @@ export class BenchmarkDatabase extends EventEmitter {
           status = ?,
           error = ?,
           started_at = CASE WHEN ? = 'running' THEN COALESCE(started_at, ?) ELSE started_at END,
-          completed_at = CASE WHEN ? IN ('completed', 'failed', 'cancelled') THEN ? ELSE completed_at END
+          completed_at = CASE WHEN ? IN ('completed', 'failed', 'cancelled') THEN ? ELSE NULL END
         WHERE id = ?
       `)
       .run(status, error, status, now, status, now, id);
@@ -173,16 +211,24 @@ export class BenchmarkDatabase extends EventEmitter {
     this.transaction(() => {
       this.db
         .prepare(`
-          UPDATE runs SET status = 'queued', session_id = NULL, error = NULL,
-            available_at = ?, updated_at = ?
-          WHERE experiment_id = ? AND status IN ('preparing', 'running', 'retrying')
+          UPDATE runs SET status = 'queued', error = NULL, completed_at = NULL,
+            current_round = (
+              SELECT COUNT(*) FROM rounds
+              WHERE rounds.run_id = runs.id AND rounds.status = 'completed'
+            ),
+            resume_pending = 1, available_at = ?, updated_at = ?
+          WHERE experiment_id = ? AND status IN ('preparing', 'running')
         `)
         .run(now, now, experimentId);
       this.db
         .prepare(`
           UPDATE rounds SET status = 'pending', started_at = NULL, completed_at = NULL,
-            response = NULL, error = NULL
-          WHERE run_id IN (SELECT id FROM runs WHERE experiment_id = ? AND status = 'queued')
+            response = NULL, error = NULL, usage_json = NULL
+          WHERE status IN ('running', 'failed')
+            AND run_id IN (
+              SELECT id FROM runs
+              WHERE experiment_id = ? AND status = 'queued' AND resume_pending = 1
+            )
         `)
         .run(experimentId);
     });
@@ -193,6 +239,136 @@ export class BenchmarkDatabase extends EventEmitter {
       .prepare("SELECT * FROM runs WHERE experiment_id = ? ORDER BY queued_at, task_id, model_id")
       .all(experimentId) as DbRow[];
     return rows.map(mapRun);
+  }
+
+  listRunPage(
+    experimentId: string,
+    options: { page?: number; pageSize?: number; search?: string; status?: RunStatus } = {},
+  ): RunPage {
+    const requestedPage = Math.max(1, Math.trunc(options.page ?? 1));
+    const pageSize = Math.min(200, Math.max(1, Math.trunc(options.pageSize ?? 100)));
+    const search = options.search?.trim().toLowerCase() ?? "";
+    const conditions = ["experiment_id = ?"];
+    const parameters: Array<string | number> = [experimentId];
+    if (search) {
+      conditions.push("(instr(lower(task_id), ?) > 0 OR instr(lower(task_title), ?) > 0)");
+      parameters.push(search, search);
+    }
+    if (options.status) {
+      conditions.push(`EXISTS (
+        SELECT 1 FROM runs AS status_runs
+        WHERE status_runs.experiment_id = runs.experiment_id
+          AND status_runs.task_id = runs.task_id
+          AND status_runs.status = ?
+      )`);
+      parameters.push(options.status);
+    }
+    const where = conditions.join(" AND ");
+    const count = this.db
+      .prepare(`SELECT COUNT(DISTINCT task_id) AS total FROM runs WHERE ${where}`)
+      .get(...parameters) as DbRow;
+    const totalTasks = numberValue(count.total);
+    const totalPages = Math.ceil(totalTasks / pageSize);
+    const page = totalPages === 0 ? 1 : Math.min(requestedPage, totalPages);
+    const taskRows = this.db
+      .prepare(`
+        SELECT task_id, MIN(queued_at) AS first_queued,
+          MIN(CASE status
+            WHEN 'running' THEN 0
+            WHEN 'preparing' THEN 1
+            WHEN 'retrying' THEN 2
+            WHEN 'queued' THEN 3
+            WHEN 'awaiting_stage' THEN 4
+            WHEN 'completed' THEN 5
+            WHEN 'failed' THEN 6
+            WHEN 'cancelled' THEN 7
+            ELSE 8
+          END) AS status_priority
+        FROM runs
+        WHERE ${where}
+        GROUP BY task_id
+        ORDER BY status_priority, first_queued, task_id
+        LIMIT ? OFFSET ?
+      `)
+      .all(...parameters, pageSize, (page - 1) * pageSize) as DbRow[];
+    const taskIds = taskRows.map((row) => stringValue(row.task_id));
+    if (taskIds.length === 0) {
+      return { runs: [], page, pageSize, totalTasks, totalPages, hasNextPage: false };
+    }
+    const placeholders = taskIds.map(() => "?").join(", ");
+    const rows = this.db
+      .prepare(`
+        SELECT runs.*, (
+          SELECT COUNT(*) FROM rounds
+          WHERE rounds.run_id = runs.id AND rounds.status = 'completed'
+        ) AS completed_rounds
+        FROM runs
+        WHERE experiment_id = ? AND task_id IN (${placeholders})
+        ORDER BY queued_at, task_id, model_id
+      `)
+      .all(experimentId, ...taskIds) as DbRow[];
+    const taskOrder = new Map(taskIds.map((taskId, index) => [taskId, index]));
+    rows.sort((left, right) => {
+      const taskDifference = (taskOrder.get(stringValue(left.task_id)) ?? taskIds.length)
+        - (taskOrder.get(stringValue(right.task_id)) ?? taskIds.length);
+      if (taskDifference !== 0) return taskDifference;
+      return stringValue(left.model_id).localeCompare(stringValue(right.model_id));
+    });
+    return {
+      runs: rows.map((row) => ({ ...mapRun(row), completedRounds: numberValue(row.completed_rounds) })),
+      page,
+      pageSize,
+      totalTasks,
+      totalPages,
+      hasNextPage: page < totalPages,
+    };
+  }
+
+  getModelRunSummaries(experimentId: string): ModelRunSummary[] {
+    const rows = this.db
+      .prepare(`
+        SELECT
+          runs.model_id,
+          runs.provider_id,
+          COUNT(*) AS total,
+          SUM(CASE WHEN runs.status = 'queued' THEN 1 ELSE 0 END) AS queued,
+          SUM(CASE WHEN runs.status = 'preparing' THEN 1 ELSE 0 END) AS preparing,
+          SUM(CASE WHEN runs.status = 'running' THEN 1 ELSE 0 END) AS running,
+          SUM(CASE WHEN runs.status = 'retrying' THEN 1 ELSE 0 END) AS retrying,
+          SUM(CASE WHEN runs.status = 'awaiting_stage' THEN 1 ELSE 0 END) AS awaiting_stage,
+          SUM(CASE WHEN runs.status = 'completed' THEN 1 ELSE 0 END) AS completed,
+          SUM(CASE WHEN runs.status = 'failed' THEN 1 ELSE 0 END) AS failed,
+          SUM(CASE WHEN runs.status = 'cancelled' THEN 1 ELSE 0 END) AS cancelled,
+          SUM(COALESCE(round_counts.completed_rounds, 0)) AS completed_rounds,
+          SUM(runs.total_rounds) AS total_rounds,
+          MIN(runs.queued_at) AS first_queued
+        FROM runs
+        LEFT JOIN (
+          SELECT run_id, COUNT(*) AS completed_rounds
+          FROM rounds
+          WHERE status = 'completed'
+          GROUP BY run_id
+        ) AS round_counts ON round_counts.run_id = runs.id
+        WHERE runs.experiment_id = ?
+        GROUP BY runs.model_id, runs.provider_id
+        ORDER BY first_queued, runs.model_id
+      `)
+      .all(experimentId) as DbRow[];
+    return rows.map((row) => ({
+      modelId: stringValue(row.model_id),
+      providerId: stringValue(row.provider_id),
+      total: numberValue(row.total),
+      queued: numberValue(row.queued),
+      preparing: numberValue(row.preparing),
+      running: numberValue(row.running),
+      retrying: numberValue(row.retrying),
+      awaitingStage: numberValue(row.awaiting_stage),
+      completed: numberValue(row.completed),
+      failed: numberValue(row.failed),
+      cancelled: numberValue(row.cancelled),
+      completedRounds: numberValue(row.completed_rounds),
+      totalRounds: numberValue(row.total_rounds),
+    }));
   }
 
   listRunnableRuns(
@@ -212,7 +388,9 @@ export class BenchmarkDatabase extends EventEmitter {
           (runs.status IN ('queued', 'retrying') AND runs.available_at <= ?)
           OR (runs.status = 'awaiting_stage' AND runs.current_round < experiments.target_round)
         )
-        ORDER BY runs.available_at, runs.queued_at, runs.task_id, runs.model_id
+        ORDER BY
+          CASE WHEN runs.resume_pending = 1 THEN 0 ELSE 1 END,
+          runs.available_at, runs.queued_at, runs.task_id, runs.model_id
         ${normalizedLimit === null ? "" : "LIMIT ?"}
       `)
       .all(...(normalizedLimit === null
@@ -229,12 +407,15 @@ export class BenchmarkDatabase extends EventEmitter {
   claimRun(id: string): RunRecord | null {
     const current = this.getRun(id);
     if (!current) return null;
-    const continuingStage = current.status === "awaiting_stage";
     const now = Date.now();
     const result = this.db
       .prepare(`
         UPDATE runs SET status = 'preparing',
-          attempt = CASE WHEN status = 'awaiting_stage' THEN attempt ELSE attempt + 1 END,
+          attempt = CASE
+            WHEN status = 'awaiting_stage' OR resume_pending = 1 THEN attempt
+            ELSE attempt + 1
+          END,
+          resume_pending = 0,
           error = NULL,
           started_at = COALESCE(started_at, ?), completed_at = NULL, updated_at = ?
         WHERE id = ? AND (
@@ -247,15 +428,8 @@ export class BenchmarkDatabase extends EventEmitter {
       `)
       .run(now, now, id, now);
     if (Number(result.changes) === 0) return null;
-    if (!continuingStage) {
-      this.db
-        .prepare(`
-          UPDATE rounds SET status = 'pending', started_at = NULL, completed_at = NULL,
-            response = NULL, error = NULL WHERE run_id = ?
-        `)
-        .run(id);
-    }
-    return this.getRun(id);
+    const claimed = this.getRun(id);
+    return claimed ? { ...claimed, resumePending: current.resumePending } : null;
   }
 
   updateRun(
@@ -277,7 +451,7 @@ export class BenchmarkDatabase extends EventEmitter {
       .prepare(`
         UPDATE runs SET status = ?, current_round = ?, workspace_path = ?, session_id = ?,
           error = ?, available_at = ?, updated_at = ?,
-          completed_at = CASE WHEN ? IN ('completed', 'failed', 'cancelled') THEN ? ELSE completed_at END
+          completed_at = CASE WHEN ? IN ('completed', 'failed', 'cancelled') THEN ? ELSE NULL END
         WHERE id = ?
       `)
       .run(
@@ -298,21 +472,77 @@ export class BenchmarkDatabase extends EventEmitter {
     id: string,
     delayMs: number,
     error: string,
-    options: { preserveAttemptBudget?: boolean } = {},
+    options: { preserveProgress?: boolean; preserveSession?: boolean } = {},
   ): void {
     const now = Date.now();
-    if (options.preserveAttemptBudget) {
-      this.db
-        .prepare("UPDATE runs SET max_attempts = max_attempts + 1 WHERE id = ?")
-        .run(id);
+    if (options.preserveProgress) {
+      this.transaction(() => {
+        this.db
+          .prepare(`
+            UPDATE rounds SET status = 'pending', started_at = NULL, completed_at = NULL,
+              response = NULL, error = NULL, usage_json = NULL
+            WHERE run_id = ? AND status != 'completed'
+          `)
+          .run(id);
+        this.db
+          .prepare(`
+            UPDATE runs SET status = 'retrying',
+              current_round = (
+                SELECT COUNT(*) FROM rounds
+                WHERE rounds.run_id = runs.id AND rounds.status = 'completed'
+              ),
+              resume_pending = 1, error = ?, available_at = ?, completed_at = NULL,
+              updated_at = ?
+            WHERE id = ?
+          `)
+          .run(error, now + delayMs, now, id);
+      });
+      return;
     }
-    this.updateRun(id, {
-      status: "retrying",
-      currentRound: 0,
-      sessionId: null,
-      error,
-      availableAt: now + delayMs,
+    this.transaction(() => {
+      this.db
+        .prepare(`
+          UPDATE rounds SET status = 'pending', started_at = NULL, completed_at = NULL,
+            response = NULL, error = NULL, usage_json = NULL WHERE run_id = ?
+        `)
+        .run(id);
+      this.db
+        .prepare(`
+          UPDATE runs SET status = 'retrying', current_round = 0, resume_pending = 0,
+            session_id = CASE WHEN ? THEN session_id ELSE NULL END,
+            error = ?, available_at = ?, completed_at = NULL,
+            updated_at = ? WHERE id = ?
+        `)
+        .run(options.preserveSession ? 1 : 0, error, now + delayMs, now, id);
     });
+  }
+
+  recordInfrastructureFailure(id: string, failedAt = Date.now()): InfrastructureRetryState {
+    this.db
+      .prepare(`
+        UPDATE runs SET infra_attempts = infra_attempts + 1,
+          infra_first_failed_at = COALESCE(infra_first_failed_at, ?), updated_at = ?
+        WHERE id = ?
+      `)
+      .run(failedAt, failedAt, id);
+    return this.getInfrastructureRetryState(id);
+  }
+
+  getInfrastructureRetryState(id: string): InfrastructureRetryState {
+    const row = this.db
+      .prepare("SELECT infra_attempts, infra_first_failed_at FROM runs WHERE id = ?")
+      .get(id) as DbRow | undefined;
+    if (!row) throw new Error(`运行不存在: ${id}`);
+    return {
+      attempts: numberValue(row.infra_attempts),
+      firstFailedAt: nullableNumber(row.infra_first_failed_at),
+    };
+  }
+
+  clearInfrastructureFailures(id: string): void {
+    this.db
+      .prepare("UPDATE runs SET infra_attempts = 0, infra_first_failed_at = NULL WHERE id = ?")
+      .run(id);
   }
 
   resetFailedRun(id: string): void {
@@ -326,14 +556,15 @@ export class BenchmarkDatabase extends EventEmitter {
       .prepare(`
         UPDATE runs SET status = 'queued', current_round = 0,
           max_attempts = MAX(max_attempts, attempt + 1), available_at = ?,
-          session_id = NULL, error = NULL, completed_at = NULL, updated_at = ?
+          session_id = NULL, error = NULL, completed_at = NULL, updated_at = ?,
+          resume_pending = 0, infra_attempts = 0, infra_first_failed_at = NULL
         WHERE id = ?
       `)
       .run(now, now, id);
     this.db
       .prepare(`
         UPDATE rounds SET status = 'pending', started_at = NULL, completed_at = NULL,
-          response = NULL, error = NULL WHERE run_id = ?
+          response = NULL, error = NULL, usage_json = NULL WHERE run_id = ?
       `)
       .run(id);
   }
@@ -349,7 +580,7 @@ export class BenchmarkDatabase extends EventEmitter {
     runId: string,
     roundIndex: number,
     status: RoundStatus,
-    values: { response?: string | null; error?: string | null } = {},
+    values: { response?: string | null; error?: string | null; usage?: HarnessUsage | null } = {},
   ): void {
     const now = Date.now();
     this.db
@@ -357,7 +588,8 @@ export class BenchmarkDatabase extends EventEmitter {
         UPDATE rounds SET status = ?,
           started_at = CASE WHEN ? = 'running' THEN ? ELSE started_at END,
           completed_at = CASE WHEN ? IN ('completed', 'failed') THEN ? ELSE completed_at END,
-          response = COALESCE(?, response), error = ?
+          response = COALESCE(?, response), error = ?,
+          usage_json = COALESCE(?, usage_json)
         WHERE run_id = ? AND round_index = ?
       `)
       .run(
@@ -368,6 +600,9 @@ export class BenchmarkDatabase extends EventEmitter {
         now,
         values.response ?? null,
         values.error ?? null,
+        values.usage === undefined || values.usage === null
+          ? null
+          : JSON.stringify(values.usage),
         runId,
         roundIndex,
       );
@@ -402,7 +637,10 @@ export class BenchmarkDatabase extends EventEmitter {
     };
   }
 
-  getRoundSummary(experimentId: string): RoundSummary {
+  getRoundSummary(
+    experimentId: string,
+    options: { openedOnly?: boolean } = {},
+  ): RoundSummary {
     const row = this.db
       .prepare(`
         SELECT
@@ -413,7 +651,9 @@ export class BenchmarkDatabase extends EventEmitter {
           SUM(CASE WHEN rounds.status = 'failed' THEN 1 ELSE 0 END) AS failed
         FROM rounds
         JOIN runs ON runs.id = rounds.run_id
+        JOIN experiments ON experiments.id = runs.experiment_id
         WHERE runs.experiment_id = ?
+          ${options.openedOnly ? "AND rounds.round_index < experiments.target_round" : ""}
       `)
       .get(experimentId) as DbRow;
     return {
@@ -425,6 +665,37 @@ export class BenchmarkDatabase extends EventEmitter {
     };
   }
 
+  getUsageSummary(experimentId: string): UsageSummary {
+    const rows = this.db
+      .prepare(`
+        SELECT rounds.usage_json
+        FROM rounds
+        JOIN runs ON runs.id = rounds.run_id
+        WHERE runs.experiment_id = ? AND rounds.usage_json IS NOT NULL
+      `)
+      .all(experimentId) as DbRow[];
+    const summary: UsageSummary = {
+      rounds: 0,
+      input: 0,
+      output: 0,
+      reasoning: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      cost: 0,
+    };
+    for (const row of rows) {
+      const usage = JSON.parse(stringValue(row.usage_json)) as Partial<HarnessUsage>;
+      summary.rounds += 1;
+      summary.input += finiteNumber(usage.input);
+      summary.output += finiteNumber(usage.output);
+      summary.reasoning += finiteNumber(usage.reasoning);
+      summary.cacheRead += finiteNumber(usage.cacheRead);
+      summary.cacheWrite += finiteNumber(usage.cacheWrite);
+      summary.cost += finiteNumber(usage.cost);
+    }
+    return summary;
+  }
+
   appendEvent(
     experimentId: string,
     runId: string | null,
@@ -434,12 +705,13 @@ export class BenchmarkDatabase extends EventEmitter {
     data: Record<string, unknown> = {},
   ): GenerationEvent {
     const createdAt = Date.now();
+    const storedData = boundedEventData(data, this.eventDataMaxBytes);
     const result = this.db
       .prepare(`
         INSERT INTO events (experiment_id, run_id, type, level, message, data_json, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?)
       `)
-      .run(experimentId, runId, type, level, message, JSON.stringify(data), createdAt);
+      .run(experimentId, runId, type, level, message, JSON.stringify(storedData), createdAt);
     const event: GenerationEvent = {
       id: Number(result.lastInsertRowid),
       experimentId,
@@ -447,10 +719,15 @@ export class BenchmarkDatabase extends EventEmitter {
       type,
       level,
       message,
-      data,
+      data: storedData,
       createdAt,
     };
     this.emit("event", event);
+    this.eventsSincePrune += 1;
+    if (this.eventsSincePrune >= EVENT_PRUNE_INTERVAL) {
+      this.eventsSincePrune = 0;
+      this.pruneEvents(experimentId);
+    }
     return event;
   }
 
@@ -458,26 +735,62 @@ export class BenchmarkDatabase extends EventEmitter {
     experimentId: string;
     runId?: string;
     afterId?: number;
+    beforeId?: number;
     limit?: number;
+    newest?: boolean;
   }): GenerationEvent[] {
-    const afterId = options.afterId ?? 0;
+    return this.listEventPage(options).events;
+  }
+
+  listEventPage(options: {
+    experimentId: string;
+    runId?: string;
+    afterId?: number;
+    beforeId?: number;
+    limit?: number;
+    newest?: boolean;
+  }): EventPage {
+    const afterId = Math.max(0, options.afterId ?? 0);
+    const beforeId = Math.max(1, options.beforeId ?? Number.MAX_SAFE_INTEGER);
     const limit = Math.min(Math.max(options.limit ?? 500, 1), 2_000);
-    let statement: StatementSync;
-    let rows: DbRow[];
-    if (options.runId) {
-      statement = this.db.prepare(`
-        SELECT * FROM events WHERE experiment_id = ? AND run_id = ? AND id > ?
-        ORDER BY id ASC LIMIT ?
-      `);
-      rows = statement.all(options.experimentId, options.runId, afterId, limit) as DbRow[];
-    } else {
-      statement = this.db.prepare(`
-        SELECT * FROM events WHERE experiment_id = ? AND id > ?
-        ORDER BY id ASC LIMIT ?
-      `);
-      rows = statement.all(options.experimentId, afterId, limit) as DbRow[];
-    }
-    return rows.map(mapEvent);
+    const newest = options.newest === true;
+    const runCondition = options.runId ? " AND run_id = ?" : "";
+    const cursorCondition = newest ? "id < ?" : "id > ?";
+    const order = newest ? "DESC" : "ASC";
+    const statement: StatementSync = this.db.prepare(`
+      SELECT * FROM events
+      WHERE experiment_id = ?${runCondition} AND ${cursorCondition}
+      ORDER BY id ${order} LIMIT ?
+    `);
+    const parameters: Array<string | number> = [options.experimentId];
+    if (options.runId) parameters.push(options.runId);
+    parameters.push(newest ? beforeId : afterId, limit + 1);
+    const rows = statement.all(...parameters) as DbRow[];
+    const hasMore = rows.length > limit;
+    const selected = rows.slice(0, limit);
+    if (newest) selected.reverse();
+    return { events: selected.map(mapEvent), hasMore };
+  }
+
+  pruneEvents(experimentId?: string): void {
+    this.transaction(() => {
+      if (experimentId) {
+        this.db.prepare(`
+          DELETE FROM events
+          WHERE experiment_id = ? AND id <= COALESCE((
+            SELECT id FROM events
+            WHERE experiment_id = ?
+            ORDER BY id DESC LIMIT 1 OFFSET ?
+          ), -1)
+        `).run(experimentId, experimentId, this.eventRetentionPerExperiment);
+      }
+      this.db.prepare(`
+        DELETE FROM events
+        WHERE id <= COALESCE((
+          SELECT id FROM events ORDER BY id DESC LIMIT 1 OFFSET ?
+        ), -1)
+      `).run(this.eventRetentionGlobal);
+    });
   }
 
   listRecentEvents(experimentId: string, limit = 100): GenerationEvent[] {
@@ -496,7 +809,7 @@ export class BenchmarkDatabase extends EventEmitter {
     const result = this.db
       .prepare(`
         UPDATE runs SET status = 'cancelled', completed_at = ?, updated_at = ?
-        WHERE experiment_id = ? AND status IN ('queued', 'retrying', 'awaiting_stage')
+        WHERE experiment_id = ? AND status IN ('queued', 'retrying')
       `)
       .run(now, now, experimentId);
     return Number(result.changes);
@@ -541,6 +854,9 @@ export class BenchmarkDatabase extends EventEmitter {
         started_at INTEGER,
         completed_at INTEGER,
         updated_at INTEGER NOT NULL,
+        resume_pending INTEGER NOT NULL DEFAULT 0,
+        infra_attempts INTEGER NOT NULL DEFAULT 0,
+        infra_first_failed_at INTEGER,
         UNIQUE(experiment_id, task_id, model_id)
       );
 
@@ -554,6 +870,7 @@ export class BenchmarkDatabase extends EventEmitter {
         completed_at INTEGER,
         response TEXT,
         error TEXT,
+        usage_json TEXT,
         PRIMARY KEY(run_id, round_index)
       );
 
@@ -580,6 +897,10 @@ export class BenchmarkDatabase extends EventEmitter {
     this.ensureColumn("experiments", "stage_mode", "TEXT NOT NULL DEFAULT 'all'");
     this.ensureColumn("experiments", "target_round", "INTEGER NOT NULL DEFAULT 0");
     this.ensureColumn("experiments", "max_rounds", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("runs", "resume_pending", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("runs", "infra_attempts", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("runs", "infra_first_failed_at", "INTEGER");
+    this.ensureColumn("rounds", "usage_json", "TEXT");
     this.db.exec(`
       UPDATE experiments
       SET max_rounds = COALESCE((
@@ -589,6 +910,26 @@ export class BenchmarkDatabase extends EventEmitter {
       UPDATE experiments
       SET target_round = max_rounds
       WHERE stage_mode = 'all' AND target_round != max_rounds;
+
+      UPDATE runs
+      SET status = 'awaiting_stage', completed_at = NULL
+      WHERE status = 'cancelled'
+        AND EXISTS (
+          SELECT 1
+          FROM experiments
+          WHERE experiments.id = runs.experiment_id
+            AND experiments.status = 'cancelled'
+            AND experiments.stage_mode = 'manual'
+            AND experiments.target_round > 0
+            AND experiments.target_round < runs.total_rounds
+            AND (
+              SELECT COUNT(*)
+              FROM rounds
+              WHERE rounds.run_id = runs.id
+                AND rounds.round_index < experiments.target_round
+                AND rounds.status = 'completed'
+            ) = experiments.target_round
+        );
     `);
   }
 
@@ -645,6 +986,7 @@ function mapRun(row: DbRow): RunRecord {
     totalRounds: numberValue(row.total_rounds),
     attempt: numberValue(row.attempt),
     maxAttempts: numberValue(row.max_attempts),
+    resumePending: numberValue(row.resume_pending) === 1,
     availableAt: numberValue(row.available_at),
     workspacePath: nullableString(row.workspace_path),
     sessionId: nullableString(row.session_id),
@@ -697,4 +1039,28 @@ function nullableNumber(value: unknown): number | null {
 
 function nullableString(value: unknown): string | null {
   return value === null || value === undefined ? null : String(value);
+}
+
+function finiteNumber(value: unknown): number {
+  const number = Number(value ?? 0);
+  return Number.isFinite(number) ? number : 0;
+}
+
+function positiveIntegerEnvironment(name: string, fallback: number): number {
+  const parsed = Number.parseInt(process.env[name] ?? "", 10);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function boundedEventData(
+  data: Record<string, unknown>,
+  maximumBytes: number,
+): Record<string, unknown> {
+  const serialized = JSON.stringify(data);
+  const originalBytes = Buffer.byteLength(serialized, "utf8");
+  if (originalBytes <= maximumBytes) return data;
+  return {
+    truncated: true,
+    originalBytes,
+    preview: Buffer.from(serialized, "utf8").subarray(0, maximumBytes).toString("utf8"),
+  };
 }

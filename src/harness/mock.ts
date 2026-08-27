@@ -59,7 +59,14 @@ export class MockHarness implements GenerationHarness {
     });
     return {
       response: `Mock model completed ${round.id}`,
-      usage: { input: round.prompt.length, output: 128, reasoning: 0, cost: 0 },
+      usage: {
+        input: round.prompt.length,
+        output: 128,
+        reasoning: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        cost: 0,
+      },
     };
   }
 

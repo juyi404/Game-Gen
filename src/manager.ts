@@ -35,8 +35,18 @@ export class OrchestratorManager {
     }
     const persisted = this.db.getExperiment(experimentId);
     if (!persisted) throw new Error(`生成实验不存在: ${experimentId}`);
-    const experiment = configOverride ? { ...persisted, config: configOverride } : persisted;
-    const loaded = await loadBenchmarkConfig(experiment.configPath);
+    const loaded = await loadBenchmarkConfig(persisted.configPath);
+    const recoveredConfig = {
+      ...loaded.config,
+      ...persisted.config,
+      ...configOverride,
+      runtime: {
+        ...loaded.config.runtime,
+        ...persisted.config.runtime,
+        ...configOverride?.runtime,
+      },
+    };
+    const experiment = { ...persisted, config: recoveredConfig };
     const tasks = this.hydratePersistedRounds(experiment, loaded.tasks);
     return this.startExperiment(experiment, tasks);
   }
@@ -57,7 +67,7 @@ export class OrchestratorManager {
     await this.requireActive(experimentId).cancel();
   }
 
-  async retryRun(runId: string): Promise<void> {
+  async retryRun(runId: string, configOverride?: ResolvedBenchmarkConfig): Promise<void> {
     const run = this.db.getRun(runId);
     if (!run) throw new Error(`运行不存在: ${runId}`);
     this.db.resetFailedRun(runId);
@@ -71,7 +81,7 @@ export class OrchestratorManager {
     );
     const active = this.get(run.experimentId);
     if (active) active.resume();
-    else await this.startExisting(run.experimentId);
+    else await this.startExisting(run.experimentId, configOverride);
   }
 
   async advanceStage(

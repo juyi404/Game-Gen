@@ -41,9 +41,29 @@
             <section class="step-card panel" data-step="1">
               <header class="step-heading">
                 <span class="step-number">01</span>
-                <div><p class="section-kicker">第一步 · 题库</p><h2>导入游戏题目 JSON</h2><span>支持每题一个 JSON，也支持单个文件用 <code>games</code> 数组保存全部题目；多轮 Prompt 按 <code>rounds</code> 顺序执行。</span></div>
+                <div><p class="section-kicker">第一步 · API</p><h2>连接并验证模型供应商</h2><span>聚合 API、PackyAPI 和 OpenCode 原生供应商统一通过正式链路实测；只有成功调用工具的模型才能进入任务。</span></div>
+                <span id="provider-step-state" class="step-state pending">未连接</span>
+              </header>
+
+              <div class="provider-onboarding">
+                <div id="credential-summary" class="credential-summary"><i></i><span>尚未连接并验证模型供应商</span></div>
+                <div class="toolbar-actions">
+                  <button id="auto-detect-models-button" class="button primary" type="button">填写 API 并验证模型</button>
+                  <button id="provider-manager-button" class="button secondary" type="button">供应商与模型</button>
+                  <button id="sync-models-button" class="button secondary" type="button">刷新并复测</button>
+                </div>
+              </div>
+              <p class="step-inline-note">验证会对目录中的每个模型发送一次真实工具调用并消耗少量 Token；调用失败的模型不会进入后续多选列表。</p>
+            </section>
+
+            <section class="step-card panel" data-step="2">
+              <header class="step-heading">
+                <span class="step-number">02</span>
+                <div><p class="section-kicker">第二步 · 题库</p><h2>导入实际游戏题库</h2><span>支持每题一个 JSON，也支持单个文件用 <code>games</code> 数组保存全部题目；多轮 Prompt 按 <code>rounds</code> 顺序执行。</span></div>
                 <span id="dataset-step-state" class="step-state pending">未选择</span>
               </header>
+
+              <p id="dataset-lock-note" class="step-lock-note">请先在第一步至少验证 1 个模型；验证成功后才可导入或选择题库。</p>
 
               <div id="upload-zone" class="upload-zone" tabindex="0" role="button" aria-label="选择 JSON 文件">
                 <div class="upload-icon">↑</div>
@@ -71,22 +91,25 @@
               </div>
             </section>
 
-            <section class="step-card panel" data-step="2">
+            <section class="step-card panel" data-step="3">
               <header class="step-heading">
-                <span class="step-number">02</span>
-                <div><p class="section-kicker">第二步 · 模型</p><h2>选择模型并连接供应商</h2><span>每道题都会分别交给所有启用的模型；密钥只写入本机 OpenCode 凭据库。</span></div>
+                <span class="step-number">03</span>
+                <div><p class="section-kicker">第三步 · 模型</p><h2>为当前题库选择多个模型</h2><span>从第一步实测通过的模型池中勾选一个或多个模型；每个启用模型都会独立运行当前题库的全部题目。</span></div>
                 <span id="model-step-state" class="step-state pending">待配置</span>
               </header>
 
-              <div class="model-toolbar">
-                <div id="credential-summary" class="credential-summary"><i></i><span>尚未检查本机模型与登录状态</span></div>
-                <div class="toolbar-actions">
-                  <button id="provider-manager-button" class="button secondary" type="button">供应商与模型</button>
-                  <button id="sync-models-button" class="button secondary" type="button">刷新接入状态</button>
-                  <button id="add-model-button" class="button primary" type="button">＋ 添加空行</button>
-                </div>
+              <div class="verified-model-heading">
+                <div><strong id="model-selection-summary">请先连接 API 并选择题库</strong><span>支持多选；聚合、PackyAPI 和原生供应商中通过 OpenCode 端到端验证的模型都会出现在这里。</span></div>
+                <label class="verified-model-search"><span class="visually-hidden">搜索已验证模型</span><input id="verified-model-search" type="search" placeholder="搜索模型或供应商" autocomplete="off" /></label>
               </div>
+              <div class="verified-model-actions">
+                <button id="select-all-verified-models-button" class="button secondary" type="button">选择全部可用模型</button>
+                <button id="clear-selected-models-button" class="button ghost" type="button">清空选择</button>
+              </div>
+              <div id="verified-model-picker" class="verified-model-picker"><div class="empty-state">完成 API 验证后显示可选模型。</div></div>
 
+              <div class="selected-model-settings">
+                <div class="subheading"><div><h3>已选模型运行设置</h3><span>可分别调整显示名称、推理强度和单模型并发；真实运行只接受上方实测通过的模型。</span></div><button id="add-model-button" class="button secondary" type="button">＋ 演练模式手动添加</button></div>
               <div class="model-table-wrap">
                 <table class="model-config-table">
                   <thead><tr><th>启用</th><th>显示名称</th><th>模型选择</th><th>推理强度</th><th>单模型并发</th><th>接入检查</th><th></th></tr></thead>
@@ -95,12 +118,13 @@
               </div>
               <datalist id="model-catalog-options"></datalist>
               <p class="table-hint">推理强度按“供应商 + 模型”动态读取：同名模型经不同供应商接入时，可选档位也可能不同。页面只显示 OpenCode 实际返回的 none、minimal、low、medium、high、xhigh、max、ultra 等可用子集；没有可调档位时使用供应商默认行为。GPT-5.6 API 的最高推理档位是 max；Codex 的 ultra 是多代理执行模式，不会伪装成模型 API 档位。</p>
+              </div>
             </section>
 
-            <section class="step-card panel" data-step="3">
+            <section class="step-card panel" data-step="4">
               <header class="step-heading">
-                <span class="step-number">03</span>
-                <div><p class="section-kicker">第三步 · 生成策略</p><h2>设置阶段、并发与容错</h2><span>选择一次跑完全部 Prompt，或每次只跑一轮并在监控页手动推进下一阶段。</span></div>
+                <span class="step-number">04</span>
+                <div><p class="section-kicker">第四步 · 生成策略</p><h2>设置阶段、并发与容错</h2><span>选择一次跑完全部 Prompt，或每次只跑一轮并在监控页手动推进下一阶段。</span></div>
                 <span id="policy-step-state" class="step-state ready">已配置</span>
               </header>
 
@@ -109,7 +133,8 @@
               <div class="policy-grid">
                 <label class="field featured"><span>全局最大并发 <small>同时生成的游戏总数</small></span><input id="global-concurrency" type="number" min="1" max="1000" value="16" /></label>
                 <label class="field"><span>失败最大尝试次数</span><input id="max-attempts" type="number" min="1" max="10" value="3" /></label>
-                <label class="field"><span>单轮时限 <small>模型完成或自身报错后才结束</small></span><input id="round-timeout" type="text" value="不限时" readonly aria-label="单轮时限：不限时" /></label>
+                <label class="field"><span>单轮硬时限（分钟） <small>0 表示不限时</small></span><input id="round-timeout" type="number" min="0" max="1440" value="0" /></label>
+                <label class="field"><span>无事件时限（分钟） <small>持续无模型事件后中止；0 表示关闭</small></span><input id="round-idle-timeout" type="number" min="0" max="1440" value="30" /></label>
                 <label class="field"><span>重试等待（秒）</span><input id="retry-backoff" type="number" min="0" max="3600" value="15" /></label>
               </div>
 
@@ -186,9 +211,9 @@
               <section class="panel activity-panel"><div class="panel-heading"><div><p class="section-kicker">生成日志</p><h2>实时动态</h2></div><span id="event-count" class="counter">0</span></div><div id="activity-list" class="activity-list"></div></section>
             </div>
             <section class="panel matrix-panel">
-                <div class="panel-heading matrix-heading"><div><p class="section-kicker">题目 × 模型</p><h2>全部生成运行</h2></div><div class="matrix-tools"><input id="task-search" type="search" placeholder="搜索题目…" autocomplete="off" /><select id="status-filter" aria-label="按状态筛选"><option value="">全部状态</option><option value="running">运行中</option><option value="retrying">重试中</option><option value="awaiting_stage">本阶段已完成</option><option value="completed">全部完成</option><option value="failed">失败</option><option value="queued">排队中</option><option value="cancelled">已取消</option></select></div></div>
+                <div class="panel-heading matrix-heading"><div><p class="section-kicker">题目 × 模型</p><h2>全部生成运行</h2></div><div class="matrix-tools"><input id="task-search" type="search" placeholder="搜索题目…" autocomplete="off" /><select id="status-filter" aria-label="按状态筛选"><option value="">全部状态</option><option value="running">运行中</option><option value="retrying">等待续跑</option><option value="awaiting_stage">本阶段已完成</option><option value="completed">全部完成</option><option value="failed">失败</option><option value="queued">排队中</option><option value="cancelled">已取消</option></select></div></div>
               <div class="matrix-wrap"><table id="run-matrix"><thead></thead><tbody></tbody></table><div id="matrix-empty" class="empty-state hidden">没有符合筛选条件的任务</div></div>
-              <button id="load-more" class="load-more hidden">显示更多任务</button>
+              <nav id="matrix-pagination" class="matrix-pagination hidden" aria-label="运行记录分页"><button id="previous-page" class="page-button" type="button">上一页</button><span id="page-summary">第 1 页</span><button id="load-more" class="page-button" type="button">下一页</button></nav>
             </section>
           </div>
         </div>
@@ -208,8 +233,9 @@
             <label class="provider-search"><span class="visually-hidden">搜索供应商</span><input id="provider-search" type="search" placeholder="搜索供应商、Provider ID 或模型" autocomplete="off" /></label>
             <div class="provider-manager-actions">
               <span id="provider-summary">尚未读取 OpenCode</span>
-              <button id="refresh-provider-dialog-button" class="button secondary" type="button">刷新</button>
-              <button id="add-packy-provider-button" class="button primary" type="button">连接 PackyAPI 分组</button>
+              <button id="refresh-provider-dialog-button" class="button secondary" type="button">刷新并复测</button>
+              <button id="add-packy-provider-button" class="button secondary" type="button">连接 PackyAPI 分组</button>
+              <button id="add-aggregator-provider-button" class="button primary" type="button">填写聚合 API 并验证</button>
             </div>
           </div>
           <div class="provider-manager-layout">
@@ -234,7 +260,7 @@
 
     <dialog id="packy-dialog" class="modal packy-modal">
       <form method="dialog" class="modal-card">
-        <header><div><p class="section-kicker">PackyAPI</p><h2 id="packy-dialog-title">连接模型分组</h2><span id="packy-dialog-subtitle">一个分组 Key 会自动接入该分组当前全部游戏生成模型。</span></div><button class="icon-button" value="cancel" aria-label="关闭">×</button></header>
+        <header><div><p class="section-kicker">PackyAPI</p><h2 id="packy-dialog-title">连接模型分组</h2><span id="packy-dialog-subtitle">请选择创建这把 Key 时使用的计费分组，再同步该分组模型。</span></div><button class="icon-button" value="cancel" aria-label="关闭">×</button></header>
         <div class="modal-body">
           <div class="packy-section-heading"><div><strong>选择 Key 所属分组</strong><span>模型来自 PackyAPI 官方实时目录，不需要手填模型 ID。</span></div><a href="https://docs.packyapi.ai/docs/token/2-group.html" target="_blank" rel="noopener">查看分组说明</a></div>
           <div id="packy-target-model" class="packy-target-model hidden"></div>
@@ -245,6 +271,24 @@
           <div id="packy-dialog-feedback" class="packy-dialog-feedback hidden" role="status"></div>
           <button id="save-packy-button" type="button" class="button primary full-width">连接分组并同步全部模型</button>
           <p class="packy-security-note">密钥不会写入题库、生成配置、运行记录或 SQLite。</p>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="aggregator-dialog" class="modal packy-modal">
+      <form method="dialog" class="modal-card">
+        <header><div><p class="section-kicker">聚合供应商</p><h2 id="aggregator-dialog-title">根据 Key 自动发现模型</h2><span>读取 /models 后逐个执行真实工具调用，只接入验证成功的模型。</span></div><button class="icon-button" value="cancel" aria-label="关闭">×</button></header>
+        <div class="modal-body">
+          <div class="packy-group-hint">API Key 本身不包含供应商地址。平台只会访问你填写的 HTTPS API Base URL，并对目录中的每个模型发起一次实际工具调用；验证会消耗少量 Token，目录可见但调用失败的模型不会显示。</div>
+          <div class="packy-form-grid">
+            <label class="field"><span>显示名称（可选）</span><input id="aggregator-provider-name" type="text" maxlength="160" autocomplete="off" placeholder="例如：团队聚合网关" /></label>
+            <label class="field"><span>Provider ID（可选）</span><input id="aggregator-provider-id" type="text" maxlength="120" autocomplete="off" placeholder="自动生成 aggregate-…" /></label>
+          </div>
+          <label class="field"><span>OpenAI 兼容 API Base URL</span><input id="aggregator-base-url" type="url" autocomplete="off" placeholder="https://gateway.example.com/v1" /></label>
+          <label class="field"><span>API Key</span><div class="secret-input"><input id="aggregator-api-key" type="password" autocomplete="off" placeholder="Key 只保存到本机 OpenCode 凭据库" /><button id="toggle-aggregator-key-button" type="button" class="text-button">显示</button></div></label>
+          <div id="aggregator-dialog-feedback" class="packy-dialog-feedback hidden" role="status"></div>
+          <button id="connect-aggregator-button" type="button" class="button primary full-width">验证 API 并导入可选模型</button>
+          <p class="packy-security-note">只支持 HTTPS；密钥不会写入题库、生成配置、运行记录或 SQLite。</p>
         </div>
       </form>
     </dialog>

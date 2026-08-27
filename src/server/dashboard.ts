@@ -1,5 +1,6 @@
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import { createReadStream, existsSync } from "node:fs";
-import { stat } from "node:fs/promises";
+import { lstat, realpath, stat } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -7,7 +8,7 @@ import { ZodError } from "zod";
 import { InputError, type ControlPlane } from "../control-plane.js";
 import type { BenchmarkDatabase } from "../database.js";
 import { StageAdvanceError, type OrchestratorManager } from "../manager.js";
-import type { ExperimentRecord, GenerationEvent } from "../types.js";
+import { RUN_STATUSES, type ExperimentRecord, type GenerationEvent, type RunStatus } from "../types.js";
 import {
   experimentManifestPath,
   experimentOutputDir,
@@ -36,6 +37,7 @@ export class DashboardServer {
     "../public",
   );
   private keepAlive: NodeJS.Timeout | null = null;
+  private readonly csrfToken = randomBytes(32).toString("base64url");
   private readonly onEvent = (event: GenerationEvent) => this.broadcast(event);
 
   constructor(
@@ -79,16 +81,24 @@ export class DashboardServer {
     const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
     const pathname = decodeURIComponent(url.pathname);
 
+    if (isStateChangingMethod(request.method)) this.assertWriteRequest(request);
+
     if (request.method === "GET" && pathname === "/api/health") {
       sendJson(response, 200, { ok: true, now: Date.now() });
       return;
     }
     if (request.method === "GET" && pathname === "/api/setup") {
+      const [datasets, modelSelections] = await Promise.all([
+        this.controlPlane.listDatasets(),
+        this.controlPlane.listDatasetModelSelections(),
+      ]);
       sendJson(response, 200, {
-        datasets: await this.controlPlane.listDatasets(),
+        datasets,
+        modelSelections,
         activeExperimentId: this.manager.activeExperimentId,
         credentialStorage: "opencode",
         localCredentialManagement: isLoopbackHost(this.options.hostname),
+        csrfToken: this.csrfToken,
         outputDir: this.controlPlane.options.outputDir,
       });
       return;
@@ -98,12 +108,28 @@ export class DashboardServer {
       sendJson(response, 201, dataset);
       return;
     }
+    const datasetModelsMatch = pathname.match(/^\/api\/datasets\/([^/]+)\/models$/);
+    if (request.method === "PUT" && datasetModelsMatch) {
+      sendJson(
+        response,
+        200,
+        await this.controlPlane.saveDatasetModelSelection(
+          datasetModelsMatch[1]!,
+          await readJson(request),
+        ),
+      );
+      return;
+    }
     if (request.method === "GET" && pathname === "/api/providers") {
       sendJson(response, 200, await this.controlPlane.listProviders());
       return;
     }
     if (request.method === "GET" && pathname === "/api/providers/packy") {
       sendJson(response, 200, await this.controlPlane.listPackyProviders());
+      return;
+    }
+    if (request.method === "GET" && pathname === "/api/providers/aggregators") {
+      sendJson(response, 200, await this.controlPlane.listAggregatorProviders());
       return;
     }
     if (request.method === "GET" && pathname === "/api/providers/packy/catalog") {
@@ -132,9 +158,28 @@ export class DashboardServer {
       );
       return;
     }
+    if (request.method === "POST" && pathname === "/api/providers/aggregators/connect") {
+      this.assertLocalCredentialManagement();
+      sendJson(
+        response,
+        201,
+        await this.controlPlane.connectAggregator(await readJson(request)),
+      );
+      return;
+    }
     if (request.method === "POST" && pathname === "/api/models/validate") {
       sendJson(response, 200, {
         checks: await this.controlPlane.validateModels(await readJson(request)),
+      });
+      return;
+    }
+    if (request.method === "GET" && pathname === "/api/models/verifications") {
+      sendJson(response, 200, await this.controlPlane.listModelVerifications());
+      return;
+    }
+    if (request.method === "POST" && pathname === "/api/models/verify") {
+      sendJson(response, 200, {
+        results: await this.controlPlane.verifyModelsActually(await readJson(request)),
       });
       return;
     }
@@ -176,11 +221,36 @@ export class DashboardServer {
     if (request.method === "GET" && experimentMatch) {
       const experiment = this.db.getExperiment(experimentMatch[1]!);
       if (!experiment) return sendJson(response, 404, { error: "生成实验不存在" });
+      const page = positiveIntegerQuery(url.searchParams.get("page"), "page", 1, 1_000_000);
+      const pageSize = positiveIntegerQuery(url.searchParams.get("pageSize"), "pageSize", 100, 200);
+      const statusValue = url.searchParams.get("status") ?? "";
+      if (statusValue && !RUN_STATUSES.includes(statusValue as RunStatus)) {
+        throw new InputError(`运行状态筛选无效: ${statusValue}`);
+      }
+      const runPage = this.db.listRunPage(experiment.id, {
+        page,
+        pageSize,
+        search: (url.searchParams.get("search") ?? "").slice(0, 200),
+        ...(statusValue ? { status: statusValue as RunStatus } : {}),
+      });
+      const roundSummary = this.db.getRoundSummary(experiment.id);
+      const openedRoundSummary = this.db.getRoundSummary(experiment.id, { openedOnly: true });
       sendJson(response, 200, {
         experiment: publicExperiment(experiment),
         summary: this.db.getSummary(experiment.id),
-        roundSummary: this.db.getRoundSummary(experiment.id),
-        runs: this.db.listRuns(experiment.id),
+        roundSummary: {
+          ...roundSummary,
+          reachableTotal: openedRoundSummary.total,
+        },
+        runs: runPage.runs,
+        runPage: {
+          page: runPage.page,
+          pageSize: runPage.pageSize,
+          totalTasks: runPage.totalTasks,
+          totalPages: runPage.totalPages,
+          hasNextPage: runPage.hasNextPage,
+        },
+        modelSummaries: this.db.getModelRunSummaries(experiment.id),
         events: this.db.listRecentEvents(experiment.id, 120),
       });
       return;
@@ -227,18 +297,19 @@ export class DashboardServer {
               ? roundContextPath(run.workspacePath, round.roundIndex, round.roundId)
               : null,
         })),
-        events: this.db.listEvents({
-          experimentId: run.experimentId,
-          runId: run.id,
-          limit: 1_000,
-        }),
+        ...this.runEventPage(run.experimentId, run.id),
       });
       return;
     }
 
     const retryMatch = pathname.match(/^\/api\/runs\/([^/]+)\/retry$/);
     if (request.method === "POST" && retryMatch) {
-      await this.manager.retryRun(retryMatch[1]!);
+      const run = this.db.getRun(retryMatch[1]!);
+      if (!run) return sendJson(response, 404, { error: "运行不存在" });
+      const experiment = this.db.getExperiment(run.experimentId);
+      if (!experiment) return sendJson(response, 404, { error: "生成实验不存在" });
+      const runtimeConfig = await this.controlPlane.prepareForRecovery(experiment.config);
+      await this.manager.retryRun(run.id, runtimeConfig);
       sendJson(response, 200, { ok: true });
       return;
     }
@@ -255,6 +326,13 @@ export class DashboardServer {
         "X-Accel-Buffering": "no",
       });
       response.write("retry: 2000\n\n");
+      let afterId = lastEventId(request, url);
+      while (true) {
+        const page = this.db.listEventPage({ experimentId, afterId, limit: 2_000 });
+        for (const event of page.events) response.write(ssePayload(event));
+        afterId = page.events.at(-1)?.id ?? afterId;
+        if (!page.hasMore) break;
+      }
       const stream = { experimentId, response };
       this.streams.add(stream);
       request.on("close", () => this.streams.delete(stream));
@@ -270,7 +348,7 @@ export class DashboardServer {
     if (request.method === "GET") {
       const staticName = pathname === "/" ? "index.html" : pathname.slice(1);
       if (["index.html", "app.js", "styles.css"].includes(staticName)) {
-        await sendFile(path.join(this.publicDir, staticName), response);
+        await sendFile(path.join(this.publicDir, staticName), response, "dashboard");
         return;
       }
     }
@@ -283,8 +361,43 @@ export class DashboardServer {
     }
   }
 
+  private assertWriteRequest(request: IncomingMessage): void {
+    if (!isLoopbackHost(this.options.hostname)) {
+      throw new RequestGuardError("写操作只允许通过 127.0.0.1、localhost 或 SSH 本地端口转发访问");
+    }
+    const fetchSite = request.headers["sec-fetch-site"];
+    if (fetchSite === "cross-site") {
+      throw new RequestGuardError("已拒绝跨站写请求");
+    }
+    const origin = request.headers.origin;
+    if (origin && !sameRequestOrigin(origin, request.headers.host)) {
+      throw new RequestGuardError("写请求来源与操作台不一致");
+    }
+    const token = request.headers["x-gamebench-csrf"];
+    if (typeof token !== "string" || !constantTimeEqual(token, this.csrfToken)) {
+      throw new RequestGuardError("操作台会话校验失败，请刷新页面后重试");
+    }
+  }
+
+  private runEventPage(experimentId: string, runId: string): {
+    events: GenerationEvent[];
+    eventPage: { limit: number; hasMore: boolean; oldestEventId: number | null; newestEventId: number | null };
+  } {
+    const page = this.db.listEventPage({ experimentId, runId, limit: 1_000, newest: true });
+    const retained = page.events;
+    return {
+      events: retained,
+      eventPage: {
+        limit: 1_000,
+        hasMore: page.hasMore,
+        oldestEventId: retained[0]?.id ?? null,
+        newestEventId: retained.at(-1)?.id ?? null,
+      },
+    };
+  }
+
   private broadcast(event: GenerationEvent): void {
-    const payload = `id: ${event.id}\nevent: generation\ndata: ${JSON.stringify(event)}\n\n`;
+    const payload = ssePayload(event);
     for (const stream of this.streams) {
       if (stream.experimentId === event.experimentId) stream.response.write(payload);
     }
@@ -297,19 +410,28 @@ export class DashboardServer {
   ): Promise<void> {
     const run = this.db.getRun(runId);
     if (!run?.workspacePath) return sendJson(response, 404, { error: "运行产物不存在" });
+    const workspaceRoot = await realpath(run.workspacePath).catch(() => null);
+    if (!workspaceRoot) return sendJson(response, 404, { error: "运行产物不存在" });
     const relativeRequest = requestedPath || "index.html";
-    const target = path.resolve(run.workspacePath, relativeRequest);
-    const relative = path.relative(run.workspacePath, target);
-    if (relative.startsWith("..") || path.isAbsolute(relative) || relative.includes(".benchmark")) {
+    let filePath = path.resolve(workspaceRoot, relativeRequest);
+    let relative = path.relative(workspaceRoot, filePath);
+    if (!isContainedRelativePath(relative) || containsPrivateArtifactSegment(relative)) {
       return sendJson(response, 403, { error: "禁止访问该路径" });
     }
-    let filePath = target;
     try {
+      await assertNoSymbolicLinks(workspaceRoot, relative);
       if ((await stat(filePath)).isDirectory()) filePath = path.join(filePath, "index.html");
+      relative = path.relative(workspaceRoot, filePath);
+      await assertNoSymbolicLinks(workspaceRoot, relative);
+      const resolvedFile = await realpath(filePath);
+      if (!isContainedRelativePath(path.relative(workspaceRoot, resolvedFile))) {
+        return sendJson(response, 403, { error: "禁止访问该路径" });
+      }
+      filePath = resolvedFile;
     } catch {
       return sendJson(response, 404, { error: "文件不存在" });
     }
-    await sendFile(filePath, response);
+    await sendFile(filePath, response, "artifact");
   }
 }
 
@@ -358,13 +480,18 @@ async function readJson(request: IncomingMessage, limit = 1024 * 1024): Promise<
   }
 }
 
-async function sendFile(filePath: string, response: ServerResponse): Promise<void> {
+async function sendFile(
+  filePath: string,
+  response: ServerResponse,
+  mode: "dashboard" | "artifact" = "dashboard",
+): Promise<void> {
   const fileInfo = await stat(filePath);
   if (!fileInfo.isFile()) return sendJson(response, 404, { error: "文件不存在" });
   response.writeHead(200, {
     "Content-Type": mimeType(filePath),
     "Content-Length": fileInfo.size,
     "Cache-Control": filePath.endsWith("index.html") ? "no-cache" : "public, max-age=60",
+    ...securityHeaders(mode),
   });
   await new Promise<void>((resolve, reject) => {
     const stream = createReadStream(filePath);
@@ -380,8 +507,24 @@ function sendJson(response: ServerResponse, status: number, body: unknown): void
     "Content-Type": "application/json; charset=utf-8",
     "Content-Length": Buffer.byteLength(payload),
     "Cache-Control": "no-store",
+    ...securityHeaders("dashboard"),
   });
   response.end(payload);
+}
+
+function positiveIntegerQuery(
+  value: string | null,
+  name: string,
+  fallback: number,
+  maximum: number,
+): number {
+  if (value === null || value === "") return fallback;
+  if (!/^\d+$/.test(value)) throw new InputError(`${name} 必须是正整数`);
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > maximum) {
+    throw new InputError(`${name} 必须在 1 到 ${maximum} 之间`);
+  }
+  return parsed;
 }
 
 function mimeType(filePath: string): string {
@@ -418,6 +561,7 @@ function errorMessage(error: unknown): string {
 }
 
 function errorStatus(error: unknown): number {
+  if (error instanceof RequestGuardError) return 403;
   if (error instanceof RequestBodyError) return error.status;
   if (error instanceof InputError || error instanceof ZodError) return 400;
   if (error instanceof StageAdvanceError) return 409;
@@ -433,4 +577,94 @@ class RequestBodyError extends Error {
   constructor(message: string, readonly status: number) {
     super(message);
   }
+}
+
+class RequestGuardError extends Error {}
+
+function isStateChangingMethod(method: string | undefined): boolean {
+  return ["POST", "PUT", "PATCH", "DELETE"].includes(method ?? "");
+}
+
+function sameRequestOrigin(origin: string, host: string | undefined): boolean {
+  if (!host) return false;
+  try {
+    const parsed = new URL(origin);
+    return ["http:", "https:"].includes(parsed.protocol) && parsed.host === host;
+  } catch {
+    return false;
+  }
+}
+
+function constantTimeEqual(actual: string, expected: string): boolean {
+  const actualBuffer = Buffer.from(actual);
+  const expectedBuffer = Buffer.from(expected);
+  return actualBuffer.length === expectedBuffer.length
+    && timingSafeEqual(actualBuffer, expectedBuffer);
+}
+
+function lastEventId(request: IncomingMessage, url: URL): number {
+  const rawHeader = request.headers["last-event-id"];
+  return Math.max(
+    safeEventId(url.searchParams.get("afterId")),
+    safeEventId(typeof rawHeader === "string" ? rawHeader : null),
+  );
+}
+
+function safeEventId(raw: string | null): number {
+  if (!raw || !/^\d+$/u.test(raw)) return 0;
+  const parsed = Number(raw);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : 0;
+}
+
+function ssePayload(event: GenerationEvent): string {
+  return `id: ${event.id}\nevent: generation\ndata: ${JSON.stringify(event)}\n\n`;
+}
+
+function isContainedRelativePath(relative: string): boolean {
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+function containsPrivateArtifactSegment(relative: string): boolean {
+  return relative.split(path.sep).some((segment) => segment === ".benchmark");
+}
+
+async function assertNoSymbolicLinks(root: string, relative: string): Promise<void> {
+  let current = root;
+  for (const segment of relative.split(path.sep).filter(Boolean)) {
+    current = path.join(current, segment);
+    if ((await lstat(current)).isSymbolicLink()) throw new Error("symbolic links are forbidden");
+  }
+}
+
+function securityHeaders(mode: "dashboard" | "artifact"): Record<string, string> {
+  const common = {
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+  };
+  if (mode === "artifact") {
+    return {
+      ...common,
+      "Access-Control-Allow-Origin": "*",
+      "Content-Security-Policy": [
+        "sandbox allow-scripts allow-pointer-lock",
+        "default-src 'self' data: blob:",
+        "script-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob:",
+        "style-src 'self' 'unsafe-inline' data: blob:",
+        "img-src 'self' data: blob:",
+        "media-src 'self' data: blob:",
+        "font-src 'self' data:",
+        "connect-src 'none'",
+        "object-src 'none'",
+        "frame-src 'none'",
+        "worker-src 'self' data: blob:",
+        "base-uri 'none'",
+        "form-action 'none'",
+      ].join("; "),
+    };
+  }
+  return {
+    ...common,
+    "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+  };
 }

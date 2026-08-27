@@ -26,6 +26,7 @@ interface OpenCodeSessionMessage {
 interface SessionEventMonitor {
   isComplete(): boolean;
   error(): unknown | null;
+  lastActivityAt(): number;
   wait(durationMs: number, signal: AbortSignal): Promise<void>;
   stop(): void;
 }
@@ -34,6 +35,7 @@ export interface OpenCodeHarnessOptions {
   connect?: typeof connectOrStartOpenCode;
   pollIntervalMs?: number;
   maxPollErrors?: number;
+  idleTimeoutMs?: number;
 }
 
 export class OpenCodeHarness implements GenerationHarness {
@@ -81,59 +83,110 @@ export class OpenCodeHarness implements GenerationHarness {
   ): Promise<HarnessRoundResult> {
     const client = this.requireClient();
     const messagesBeforeRound = await this.listSessionMessages(context, sessionId);
-    const previousMessageIds = new Set(messagesBeforeRound.map((message) => message.info.id));
-    const eventMonitor = this.monitorSessionEvents(context, sessionId);
-    try {
-      const system = buildWorkspaceSystemPrompt(
-        buildEffectiveSystemPrompt(this.systemPrompt, context.model.systemPrompt),
-        context.workspacePath,
-      );
-      const body = {
-        model: {
-          providerID: context.model.provider,
-          modelID: context.model.modelName,
-        },
-        agent: context.model.agent ?? this.config.agent,
-        system,
-        ...(context.model.reasoningEffort
-          ? { variant: context.model.reasoningEffort }
-          : {}),
-        parts: [{ type: "text" as const, text: renderRoundPrompt(round.prompt, context, roundIndex) }],
-      };
-      await client.session.promptAsync({
-        path: { id: sessionId },
-        query: { directory: context.workspacePath },
-        body,
-        signal: controlSignal(context.signal, 30_000),
-        throwOnError: true,
-      });
-      context.emit("harness.prompt.accepted", "info", "OpenCode 已接收本轮 Prompt，正在异步生成", {
-        sessionId,
-        roundIndex,
-      });
-      await this.waitForSessionCompletion(context, sessionId, previousMessageIds, eventMonitor);
-      const messages = await this.readCompletedRoundMessages(
-        context,
-        sessionId,
-        previousMessageIds,
-        eventMonitor,
-      );
-      let result: HarnessRoundResult;
+    const roundMessageIds = new Set(messagesBeforeRound.map((message) => message.info.id));
+    let previousMessageIds = roundMessageIds;
+    let continuationCount = 0;
+    const system = buildWorkspaceSystemPrompt(
+      buildEffectiveSystemPrompt(this.systemPrompt, context.model.systemPrompt),
+      context.workspacePath,
+    );
+    while (true) {
+      const eventMonitor = this.monitorSessionEvents(context, sessionId);
       try {
-        result = summarizeSessionMessages(messages, eventMonitor.error());
-      } catch (error) {
-        if (context.model.provider === "packy-claude-sale"
-          && errorMessage(error).startsWith("OpenCode 返回空结果")) {
-          throw new Error(
-            "PackyAPI 的 Claude Sale 分组仅允许官方 Claude CLI 调用；当前 OpenCode Harness 收到空结果，无法生成游戏",
-          );
+        const prompt = continuationCount === 0
+          ? renderRoundPrompt(round.prompt, context, roundIndex)
+          : UNKNOWN_FINISH_CONTINUATION_PROMPT;
+        const body = {
+          model: {
+            providerID: context.model.provider,
+            modelID: context.model.modelName,
+          },
+          agent: context.model.agent ?? this.config.agent,
+          system,
+          ...(context.model.reasoningEffort
+            ? { variant: context.model.reasoningEffort }
+            : {}),
+          parts: [{ type: "text" as const, text: prompt }],
+        };
+        await client.session.promptAsync({
+          path: { id: sessionId },
+          query: { directory: context.workspacePath },
+          body,
+          signal: controlSignal(context.signal, 30_000),
+          throwOnError: true,
+        });
+        context.emit(
+          continuationCount === 0 ? "harness.prompt.accepted" : "harness.session.continuation.accepted",
+          continuationCount === 0 ? "info" : "warn",
+          continuationCount === 0
+            ? "OpenCode 已接收本轮 Prompt，正在异步生成"
+            : "OpenCode 已接收断尾续作 Prompt，继续使用当前会话和工作目录",
+          { sessionId, roundIndex, continuationCount },
+        );
+        await this.waitForSessionCompletion(context, sessionId, previousMessageIds, eventMonitor);
+        const turnMessages = await this.readCompletedRoundMessages(
+          context,
+          sessionId,
+          previousMessageIds,
+          eventMonitor,
+        );
+        if (eventMonitor.error()) {
+          throw new Error(`OpenCode 会话失败: ${errorMessage(eventMonitor.error())}`);
         }
-        throw error;
+        const finish = latestAssistantFinish(turnMessages);
+        if (finish === "unknown") {
+          if (context.model.provider === "packy-claude-sale") {
+            try {
+              summarizeSessionMessages(turnMessages, eventMonitor.error());
+            } catch (error) {
+              if (errorMessage(error).startsWith("OpenCode 返回空结果")) {
+                throw new Error(
+                  "PackyAPI 的 Claude Sale 分组仅允许官方 Claude CLI 调用；当前 OpenCode Harness 收到空结果，无法生成游戏",
+                );
+              }
+              throw error;
+            }
+          }
+          if (continuationCount >= MAXIMUM_UNKNOWN_FINISH_CONTINUATIONS) {
+            throw new Error(
+              `OpenCode 上游响应连续异常结束：finish=unknown，已在原会话续作 ${continuationCount} 次`,
+            );
+          }
+          continuationCount += 1;
+          context.emit(
+            "harness.session.unknown_finish",
+            "warn",
+            "检测到模型响应异常断尾，将保留当前产物并在原会话自动续作",
+            {
+              sessionId,
+              roundIndex,
+              continuationCount,
+              maximumContinuations: MAXIMUM_UNKNOWN_FINISH_CONTINUATIONS,
+            },
+          );
+          const currentMessages = await this.listSessionMessages(context, sessionId);
+          previousMessageIds = new Set(currentMessages.map((message) => message.info.id));
+          continue;
+        }
+        const currentMessages = await this.listSessionMessages(context, sessionId);
+        const messages = currentMessages.filter((message) => !roundMessageIds.has(message.info.id));
+        let result: HarnessRoundResult;
+        try {
+          result = summarizeSessionMessages(messages, eventMonitor.error());
+        } catch (error) {
+          if (context.model.provider === "packy-claude-sale"
+            && errorMessage(error).startsWith("OpenCode 返回空结果")) {
+            throw new Error(
+              "PackyAPI 的 Claude Sale 分组仅允许官方 Claude CLI 调用；当前 OpenCode Harness 收到空结果，无法生成游戏",
+            );
+          }
+          throw error;
+        }
+        await validateGeneratedGameArtifacts(context.workspacePath);
+        return result;
+      } finally {
+        eventMonitor.stop();
       }
-      await validateGeneratedGameArtifacts(context.workspacePath);
-      return result;
-    } finally {
-      eventMonitor.stop();
     }
   }
 
@@ -242,6 +295,7 @@ export class OpenCodeHarness implements GenerationHarness {
     context.signal.addEventListener("abort", stopForParent, { once: true });
     let complete = false;
     let sessionError: unknown | null = null;
+    let lastActivityAt = Date.now();
     const completionListeners = new Set<() => void>();
     const finish = () => {
       if (complete) return;
@@ -258,6 +312,7 @@ export class OpenCodeHarness implements GenerationHarness {
         });
         for await (const event of result.stream) {
           if (controller.signal.aborted) break;
+          lastActivityAt = Date.now();
           if (event.type === "file.edited"
             && !isPathInsideWorkspace(context.workspacePath, event.properties.file)) {
             const violation = new Error(
@@ -299,6 +354,7 @@ export class OpenCodeHarness implements GenerationHarness {
     return {
       isComplete: () => complete,
       error: () => sessionError,
+      lastActivityAt: () => lastActivityAt,
       wait: (durationMs, signal) => {
         if (complete) return Promise.resolve();
         return new Promise((resolve, reject) => {
@@ -335,6 +391,10 @@ export class OpenCodeHarness implements GenerationHarness {
     const maxPollErrors = this.options.maxPollErrors ?? 10;
     while (!monitor.isComplete()) {
       throwIfAborted(context.signal);
+      const idleTimeoutMs = this.options.idleTimeoutMs ?? 0;
+      if (idleTimeoutMs > 0 && Date.now() - monitor.lastActivityAt() >= idleTimeoutMs) {
+        throw new Error(`模型连续 ${idleTimeoutMs}ms 没有产生执行事件，已触发空闲超时`);
+      }
       try {
         const result = await this.requireClient().session.status({
           query: { directory: context.workspacePath },
@@ -396,7 +456,14 @@ export function buildWorkspaceSystemPrompt(systemPrompt: string, workspacePath: 
     "- 所有工具路径必须位于该目录或其子目录中；不要访问父目录、兄弟目录、Git 根目录或其他绝对路径。",
     "- 即使工具界面显示了更大的项目根目录，也只能操作上述本次运行目录。",
   ].join("\n");
-  return [systemPrompt, boundary].filter(Boolean).join("\n\n");
+  const artifactContract = [
+    "离线游戏产物要求（必须遵守）：",
+    "- 最终游戏必须能在受限沙箱中离线运行；HTML、JavaScript、CSS、字体、图片、音频和模型不得引用 http://、https:// 或 // 开头的外部资源。",
+    "- 不要使用 CDN（包括 cdnjs、jsDelivr、unpkg、Tailwind CDN）。依赖必须保存到工作区内并以相对路径引用；无法本地化时改用原生 HTML/CSS/JavaScript。",
+    "- 开始前先检查工作区现有文件。若目录中已有未完成产物，应在原文件上定向修复，不能用默认模板或占位页覆盖已有成果。",
+    "- 结束前检查 index.html 不是占位页、所有本地引用确实存在，并清除损坏的合并标记、模板插值路径和不可解析的脚本。",
+  ].join("\n");
+  return [systemPrompt, boundary, artifactContract].filter(Boolean).join("\n\n");
 }
 
 export function isPathInsideWorkspace(workspacePath: string, editedPath: string): boolean {
@@ -410,7 +477,9 @@ export function isPathInsideWorkspace(workspacePath: string, editedPath: string)
 
 export function createHarness(config: ResolvedBenchmarkConfig): GenerationHarness {
   if (config.runtime.harness === "mock") return new MockHarnessProxy(config);
-  return new OpenCodeHarness(config.opencode, config.systemPrompt);
+  return new OpenCodeHarness(config.opencode, config.systemPrompt, {
+    idleTimeoutMs: config.runtime.roundIdleTimeoutMs,
+  });
 }
 
 class MockHarnessProxy implements GenerationHarness {
@@ -495,22 +564,45 @@ export function summarizeSessionMessages(
     .map((part) => part.text)
     .join("\n")
     .trim();
-  const usage = { input: 0, output: 0, reasoning: 0, cost: 0 };
+  const usage = {
+    input: 0,
+    output: 0,
+    reasoning: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    cost: 0,
+  };
   for (const part of parts) {
     if (part.type !== "step-finish") continue;
     usage.input += part.tokens.input;
     usage.output += part.tokens.output;
     usage.reasoning += part.tokens.reasoning;
+    usage.cacheRead += part.tokens.cache.read;
+    usage.cacheWrite += part.tokens.cache.write;
     usage.cost += part.cost;
   }
   const hasCompletedTool = parts.some(
     (part) => part.type === "tool" && part.state.status === "completed",
   );
   if (!response && usage.input === 0 && usage.output === 0
-    && usage.reasoning === 0 && usage.cost === 0 && !hasCompletedTool) {
+    && usage.reasoning === 0 && usage.cacheRead === 0 && usage.cacheWrite === 0
+    && usage.cost === 0 && !hasCompletedTool) {
     throw new Error("OpenCode 返回空结果：0 Token、无文本、无工具调用");
   }
   return { response, usage };
+}
+
+const MAXIMUM_UNKNOWN_FINISH_CONTINUATIONS = 3;
+const UNKNOWN_FINISH_CONTINUATION_PROMPT = [
+  "The previous model turn ended unexpectedly before the game was complete.",
+  "Continue from the files already present in the current workspace; do not restart or merely describe a plan.",
+  "Finish the requested playable game, ensure index.html is no longer the placeholder, and verify every local file reference.",
+  "Only finish your response after the implementation is complete.",
+].join(" ");
+
+function latestAssistantFinish(messages: OpenCodeSessionMessage[]): string | null {
+  const latest = [...messages].reverse().find((message) => message.info.role === "assistant");
+  return latest?.info.role === "assistant" ? latest.info.finish ?? null : null;
 }
 
 function hasTerminalAssistantMessage(messages: OpenCodeSessionMessage[]): boolean {
@@ -560,11 +652,22 @@ function emitOpenCodeEvent(
   if (part.type === "tool") {
     const state = part.state as { status?: string; title?: string; error?: string };
     const status = state.status ?? "updated";
+    // OpenCode emits the same tool part repeatedly while it moves through
+    // pending/running/completed. Persist only terminal transitions and keep
+    // the diagnostic payload bounded: full command input/output can be very
+    // large and may contain credentials returned by a tool.
+    if (status !== "completed" && status !== "error") return;
     context.emit(
       `harness.tool.${status}`,
       status === "error" ? "error" : "info",
       state.title ?? `${part.tool}: ${status}`,
-      { tool: part.tool, callId: part.callID, state: part.state },
+      {
+        tool: part.tool,
+        callId: part.callID,
+        status,
+        ...(state.title ? { title: truncateDiagnostic(state.title) } : {}),
+        ...(state.error ? { error: truncateDiagnostic(state.error) } : {}),
+      },
     );
   } else if (part.type === "step-finish") {
     context.emit("harness.step.completed", "info", "模型完成一个生成步骤", {
@@ -573,6 +676,10 @@ function emitOpenCodeEvent(
       tokens: part.tokens,
     });
   }
+}
+
+function truncateDiagnostic(value: string, maximum = 2_000): string {
+  return value.length <= maximum ? value : `${value.slice(0, maximum)}…`;
 }
 
 function errorMessage(error: unknown): string {

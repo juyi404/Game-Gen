@@ -1,12 +1,44 @@
-import { readFile, readdir, stat } from "node:fs/promises";
+import { readFile, readdir, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
 import type {
   ModelConfig,
+  PackyBillingSnapshot,
   ResolvedBenchmarkConfig,
   RoundDefinition,
   TaskDefinition,
 } from "./types.js";
+
+const MAX_ROUND_TIMEOUT_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_ROUND_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
+
+const packyBillingSnapshotSchema = z.object({
+  provider: z.literal("packy"),
+  group: z.string().min(1).max(120),
+  catalogSource: z.url(),
+  catalogFetchedAt: z.number().int().nonnegative(),
+  pricing: z.object({
+    quotaType: z.union([z.number(), z.string()]).optional(),
+    modelRatio: z.union([z.number(), z.string()]).optional(),
+    modelPrice: z.union([z.number(), z.string()]).optional(),
+    completionRatio: z.union([z.number(), z.string()]).optional(),
+    tiers: z.unknown().optional(),
+  }),
+}).transform((value): PackyBillingSnapshot => ({
+  provider: value.provider,
+  group: value.group,
+  catalogSource: value.catalogSource,
+  catalogFetchedAt: value.catalogFetchedAt,
+  pricing: {
+    ...(value.pricing.quotaType !== undefined ? { quotaType: value.pricing.quotaType } : {}),
+    ...(value.pricing.modelRatio !== undefined ? { modelRatio: value.pricing.modelRatio } : {}),
+    ...(value.pricing.modelPrice !== undefined ? { modelPrice: value.pricing.modelPrice } : {}),
+    ...(value.pricing.completionRatio !== undefined
+      ? { completionRatio: value.pricing.completionRatio }
+      : {}),
+    ...(value.pricing.tiers !== undefined ? { tiers: value.pricing.tiers } : {}),
+  },
+}));
 
 const identifierSchema = z
   .string()
@@ -21,9 +53,7 @@ const rawRoundSchema = z.union([
       id: identifierSchema.optional(),
       prompt: z.string().min(1).optional(),
       promptFile: z.string().min(1).optional(),
-      timeoutMs: z.number().int().nonnegative().optional().transform((value) => (
-        value === undefined ? undefined : 0
-      )),
+      timeoutMs: z.number().int().min(0).max(MAX_ROUND_TIMEOUT_MS).optional(),
     })
     .refine((value) => Boolean(value.prompt) !== Boolean(value.promptFile), {
       message: "每轮必须且只能设置 prompt 或 promptFile",
@@ -60,6 +90,7 @@ const rawModelSchema = z.object({
   reasoningEffort: identifierSchema.optional(),
   agent: z.string().min(1).optional(),
   systemPrompt: z.string().optional(),
+  billingSnapshot: packyBillingSnapshotSchema.optional(),
 });
 
 const rawBenchmarkSchema = z.object({
@@ -78,7 +109,9 @@ const rawBenchmarkSchema = z.object({
       providerConcurrency: z.record(z.string(), z.number().int().positive()).default({}),
       outputDir: z.string().min(1).default("./runs"),
       dataDir: z.string().min(1).default("./.gamebench"),
-      roundTimeoutMs: z.number().int().nonnegative().default(0).transform(() => 0),
+      roundTimeoutMs: z.number().int().min(0).max(MAX_ROUND_TIMEOUT_MS).default(0),
+      roundIdleTimeoutMs: z.number().int().min(0).max(MAX_ROUND_TIMEOUT_MS)
+        .default(DEFAULT_ROUND_IDLE_TIMEOUT_MS),
       maxAttempts: z.number().int().min(1).max(10).default(2),
       retryBackoffMs: z.number().int().nonnegative().default(10_000),
       workspaceTemplate: z.string().min(1).optional(),
@@ -91,6 +124,7 @@ const rawBenchmarkSchema = z.object({
       outputDir: "./runs",
       dataDir: "./.gamebench",
       roundTimeoutMs: 0,
+      roundIdleTimeoutMs: DEFAULT_ROUND_IDLE_TIMEOUT_MS,
       maxAttempts: 2,
       retryBackoffMs: 10_000,
     }),
@@ -158,6 +192,7 @@ export async function loadBenchmarkConfig(configPath: string): Promise<{
     if (model.reasoningEffort) result.reasoningEffort = model.reasoningEffort;
     if (model.agent) result.agent = model.agent;
     if (model.systemPrompt) result.systemPrompt = model.systemPrompt;
+    if (model.billingSnapshot) result.billingSnapshot = model.billingSnapshot;
     return result;
   });
 
@@ -179,6 +214,7 @@ export async function loadBenchmarkConfig(configPath: string): Promise<{
     outputDir: resolveFrom(configDir, raw.runtime.outputDir),
     dataDir: resolveFrom(configDir, raw.runtime.dataDir),
     roundTimeoutMs: raw.runtime.roundTimeoutMs,
+    roundIdleTimeoutMs: raw.runtime.roundIdleTimeoutMs,
     maxAttempts: raw.runtime.maxAttempts,
     retryBackoffMs: raw.runtime.retryBackoffMs,
   };
@@ -216,8 +252,11 @@ export async function loadBenchmarkConfig(configPath: string): Promise<{
 export async function loadTasks(
   datasetDir: string,
   includeTaskIds: string[] = [],
+  options: { references?: "within-dataset" | "forbid" } = {},
 ): Promise<TaskDefinition[]> {
-  const files = (await listJsonFiles(datasetDir)).sort((left, right) => left.localeCompare(right));
+  const datasetRoot = await realpath(datasetDir);
+  const referencePolicy = options.references ?? "within-dataset";
+  const files = (await listJsonFiles(datasetRoot)).sort((left, right) => left.localeCompare(right));
   const include = new Set(includeTaskIds);
   const taskIds = new Set<string>();
   const tasks: TaskDefinition[] = [];
@@ -238,7 +277,13 @@ export async function loadTasks(
           rounds.push({ id: `round-${index + 1}`, prompt: item });
           continue;
         }
-        const prompt = item.prompt ?? (await readFile(resolveFrom(taskDir, item.promptFile!), "utf8"));
+        if (item.promptFile && referencePolicy === "forbid") {
+          throw new Error(`网页上传题库不允许使用 promptFile: ${raw.id}/${item.id ?? `round-${index + 1}`}`);
+        }
+        const promptPath = item.promptFile
+          ? await resolveDatasetReference(datasetRoot, taskDir, item.promptFile, "文件")
+          : null;
+        const prompt = item.prompt ?? (await readFile(promptPath!, "utf8"));
         const round: RoundDefinition = { id: item.id ?? `round-${index + 1}`, prompt };
         if (item.timeoutMs !== undefined) round.timeoutMs = item.timeoutMs;
         rounds.push(round);
@@ -252,7 +297,14 @@ export async function loadTasks(
         metadata: raw.metadata,
       };
       if (raw.description) task.description = raw.description;
-      if (raw.seedDir) task.seedDir = resolveFrom(taskDir, raw.seedDir);
+      if (raw.seedDir) {
+        if (referencePolicy === "forbid") {
+          throw new Error(`网页上传题库不允许使用 seedDir: ${raw.id}`);
+        }
+        task.seedDir = await resolveDatasetReference(datasetRoot, taskDir, raw.seedDir, "目录");
+        const seedInfo = await stat(task.seedDir);
+        if (!seedInfo.isDirectory()) throw new Error(`seedDir 不是目录: ${raw.seedDir}`);
+      }
       tasks.push(task);
     }
   }
@@ -284,6 +336,26 @@ async function listJsonFiles(directory: string): Promise<string[]> {
 
 function resolveFrom(base: string, target: string): string {
   return path.isAbsolute(target) ? path.normalize(target) : path.resolve(base, target);
+}
+
+async function resolveDatasetReference(
+  datasetRoot: string,
+  taskDir: string,
+  target: string,
+  kind: "文件" | "目录",
+): Promise<string> {
+  let resolved: string;
+  try {
+    resolved = await realpath(resolveFrom(taskDir, target));
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`${kind}引用无法读取: ${target} (${detail})`);
+  }
+  const relative = path.relative(datasetRoot, resolved);
+  if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error(`${kind}引用必须位于题库目录内: ${target}`);
+  }
+  return resolved;
 }
 
 export async function assertReadableDirectory(directory: string): Promise<void> {

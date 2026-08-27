@@ -6,6 +6,12 @@ import { z } from "zod";
 import { loadBenchmarkConfig, loadTasks } from "./config.js";
 import type { OrchestratorManager } from "./manager.js";
 import {
+  type AggregatorProviderConfiguration,
+  type AggregatorProviderSummary,
+  type AggregatorModelDiscovery,
+  type ModelVerificationRecord,
+  type ModelVerificationRequest,
+  type ModelVerificationResult,
   OpenCodeService,
   PACKY_PROTOCOL_DEFAULTS,
   PACKY_PROTOCOLS,
@@ -14,6 +20,7 @@ import {
   type PackyProviderConfiguration,
   type PackyProviderSummary,
   type ProviderCatalogItem,
+  aggregatorProviderIdForBaseUrl,
   packyProviderIdForGroup,
   validateModelAccess,
 } from "./opencode-service.js";
@@ -58,13 +65,34 @@ const experimentInputSchema = z.object({
   globalConcurrency: z.number().int().min(1).max(1_000),
   providerConcurrency: z.record(z.string(), z.number().int().min(1).max(1_000)).default({}),
   maxAttempts: z.number().int().min(1).max(10).default(2),
-  roundTimeoutMs: z.number().int().nonnegative().default(0).transform(() => 0),
+  roundTimeoutMs: z.number().int().min(0).max(24 * 60 * 60 * 1000).default(0),
+  roundIdleTimeoutMs: z.number().int().min(0).max(24 * 60 * 60 * 1000)
+    .default(30 * 60 * 1000),
   retryBackoffMs: z.number().int().min(0).max(60 * 60 * 1000).default(10_000),
   systemPrompt: z.string().max(20_000).optional(),
 });
 
 const modelAccessInputSchema = z.object({
   models: z.array(experimentModelSchema).min(1).max(100),
+});
+
+const modelVerificationInputSchema = z.object({
+  models: z.array(experimentModelSchema).min(1).max(100),
+  force: z.boolean().default(false),
+});
+
+const datasetDraftModelSchema = z.object({
+  id: z.string().max(120),
+  model: z.string().max(500),
+  enabled: z.boolean().default(true),
+  concurrency: z.number().int().min(1).max(1_000),
+  reasoningEffort: identifierSchema.optional(),
+});
+
+const datasetModelSelectionInputSchema = z.object({
+  // Dataset selections are editable drafts. The stricter provider/model and ID
+  // checks still run when an experiment is created.
+  models: z.array(datasetDraftModelSchema).max(100),
 });
 
 const apiKeySchema = z.object({
@@ -111,6 +139,26 @@ const packyGroupConnectionSchema = z.object({
   targetModelId: packyModelIdSchema.optional(),
 });
 
+const aggregatorConnectionSchema = z.object({
+  providerId: identifierSchema
+    .refine((value) => value.startsWith("aggregate-"), {
+      message: "聚合供应商标识必须以 aggregate- 开头",
+    })
+    .optional(),
+  name: z.string().trim().min(1).max(160).optional(),
+  baseUrl: z.url().refine((value) => {
+    const url = new URL(value);
+    return url.protocol === "https:"
+      && !url.username
+      && !url.password
+      && !url.search
+      && !url.hash;
+  }, {
+    message: "API Base URL 必须是无账号、查询参数和片段的 HTTPS 地址",
+  }),
+  apiKey: z.string().trim().min(1).max(20_000),
+});
+
 const manifestSchema = z.object({
   id: identifierSchema,
   name: z.string(),
@@ -124,6 +172,10 @@ const manifestSchema = z.object({
 
 export type DatasetSummary = z.infer<typeof manifestSchema>;
 export type ExperimentInput = z.infer<typeof experimentInputSchema>;
+export type DatasetModelSelection = z.infer<typeof datasetModelSelectionInputSchema> & {
+  datasetId: string;
+  updatedAt: number;
+};
 
 export interface ControlPlaneOptions {
   projectRoot: string;
@@ -143,6 +195,19 @@ interface ProviderGateway {
   listPackyCatalog(force?: boolean): Promise<PackyCatalog>;
   listPackyAuthorizedModels(apiKey: string): Promise<string[]>;
   configurePackyProvider(input: PackyProviderConfiguration): Promise<PackyProviderSummary>;
+  listAggregatorProviders(): Promise<AggregatorProviderSummary[]>;
+  discoverAggregatorModels(
+    baseUrl: string,
+    apiKey: string,
+  ): Promise<AggregatorModelDiscovery>;
+  configureAggregatorProvider(
+    input: AggregatorProviderConfiguration,
+  ): Promise<AggregatorProviderSummary>;
+  listModelVerifications(): Promise<ModelVerificationRecord[]>;
+  verifyModels(
+    requests: ModelVerificationRequest[],
+    force?: boolean,
+  ): Promise<ModelVerificationResult[]>;
   setApiKey(providerId: string, key: string): Promise<void>;
   startOAuth(providerId: string, method: number): Promise<{
     url: string;
@@ -157,6 +222,8 @@ export class ControlPlane {
   readonly datasetsDir: string;
   readonly configsDir: string;
   private readonly providerGateway: ProviderGateway;
+  private datasetModelSelections: Record<string, DatasetModelSelection> = {};
+  private datasetModelSelectionsLoaded = false;
 
   constructor(
     private readonly manager: OrchestratorManager,
@@ -190,6 +257,31 @@ export class ControlPlane {
     return datasets.sort((left, right) => right.createdAt - left.createdAt);
   }
 
+  async listDatasetModelSelections(): Promise<Record<string, DatasetModelSelection>> {
+    await this.loadDatasetModelSelections();
+    return structuredClone(this.datasetModelSelections);
+  }
+
+  async saveDatasetModelSelection(
+    datasetId: string,
+    input: unknown,
+  ): Promise<DatasetModelSelection> {
+    if (!identifierSchema.safeParse(datasetId).success
+      || !existsSync(path.join(this.datasetsDir, datasetId, ".dataset.json"))) {
+      throw new InputError("所选题库不存在");
+    }
+    const parsed = datasetModelSelectionInputSchema.parse(input);
+    const enabledIds = parsed.models
+      .filter((model) => model.enabled && model.id.length > 0)
+      .map((model) => model.id);
+    if (new Set(enabledIds).size !== enabledIds.length) throw new InputError("模型显示名称不能重复");
+    await this.loadDatasetModelSelections();
+    const selection = { datasetId, models: parsed.models, updatedAt: Date.now() };
+    this.datasetModelSelections[datasetId] = selection;
+    await this.persistDatasetModelSelections();
+    return structuredClone(selection);
+  }
+
   async importDataset(input: unknown): Promise<DatasetSummary> {
     const parsed = datasetImportSchema.parse(input);
     await this.initialize();
@@ -212,7 +304,7 @@ export class ControlPlane {
         await writeFile(target, content, "utf8");
       }
 
-      const tasks = await loadTasks(temporaryDir);
+      const tasks = await loadTasks(temporaryDir, [], { references: "forbid" });
       const summary: DatasetSummary = {
         id,
         name: parsed.name,
@@ -250,6 +342,58 @@ export class ControlPlane {
 
   async listPackyCatalog(force = false): Promise<PackyCatalog> {
     return this.providerGateway.listPackyCatalog(force);
+  }
+
+  async listAggregatorProviders(): Promise<AggregatorProviderSummary[]> {
+    return this.providerGateway.listAggregatorProviders();
+  }
+
+  async listModelVerifications(): Promise<ModelVerificationRecord[]> {
+    return this.providerGateway.listModelVerifications();
+  }
+
+  async verifyModelsActually(input: unknown): Promise<ModelVerificationResult[]> {
+    const parsed = modelVerificationInputSchema.parse(input);
+    return this.providerGateway.verifyModels(parsed.models
+      .filter((model) => model.enabled)
+      .map((model) => {
+        const slash = model.model.indexOf("/");
+        return {
+          providerId: model.model.slice(0, slash),
+          modelId: model.model.slice(slash + 1),
+          ...(model.reasoningEffort ? { reasoningEffort: model.reasoningEffort } : {}),
+        };
+      }), parsed.force);
+  }
+
+  async connectAggregator(input: unknown): Promise<AggregatorProviderSummary> {
+    const parsed = aggregatorConnectionSchema.parse(input);
+    const baseUrl = normalizeAggregatorBaseUrl(parsed.baseUrl);
+    const providerId = parsed.providerId ?? aggregatorProviderIdForBaseUrl(baseUrl);
+    const [providers, aggregators, discovery] = await Promise.all([
+      this.providerGateway.listProviders(),
+      this.providerGateway.listAggregatorProviders(),
+      this.providerGateway.discoverAggregatorModels(baseUrl, parsed.apiKey)
+        .catch((error) => {
+          throw new InputError(error instanceof Error ? error.message : String(error));
+        }),
+    ]);
+    const existing = providers.find((provider) => provider.id === providerId);
+    const existingAggregator = aggregators.find(
+      (provider) => provider.providerId === providerId,
+    );
+    if (existing && !existingAggregator) {
+      throw new InputError(`供应商标识 ${providerId} 已被其他 OpenCode 供应商使用`);
+    }
+    const hostname = new URL(baseUrl).hostname;
+    return this.providerGateway.configureAggregatorProvider({
+      providerId,
+      name: parsed.name ?? `聚合供应商 · ${hostname}`,
+      baseUrl,
+      apiKey: parsed.apiKey,
+      models: discovery.models,
+      discoveredModelCount: discovery.discoveredModelCount,
+    });
   }
 
   async configurePackyProvider(input: unknown): Promise<PackyProviderSummary> {
@@ -304,30 +448,14 @@ export class ControlPlane {
       );
     }
 
-    let group = requestedGroup;
+    const group = requestedGroup;
     if (targetModel) {
-      const eligibleGroups = catalog.groups.filter((candidate) => {
-        const protocol = parsed.protocol ?? candidate.defaultProtocol;
-        return targetModel.groups.includes(candidate.id)
-          && Boolean(protocol)
-          && candidate.protocols.includes(protocol!)
-          && targetModel.protocols.includes(protocol!);
-      });
-      if (eligibleGroups.length === 0) {
-        throw new InputError(`PackyAPI 模型 ${targetModel.id} 当前没有可供 OpenCode 接入的分组`);
+      if (!targetModel.groups.includes(group.id)) {
+        throw new InputError(
+          `PackyAPI 模型 ${targetModel.id} 不属于所选计费分组 ${group.name}；`
+          + "模型目录只能证明 Key 可访问该模型，不能证明或自动更改 Key 的计费分组。",
+        );
       }
-      const score = (candidate: (typeof eligibleGroups)[number]) => {
-        const protocol = parsed.protocol ?? candidate.defaultProtocol;
-        return catalog.models.filter((model) => model.sourceGeneration
-          && model.groups.includes(candidate.id)
-          && Boolean(protocol)
-          && model.protocols.includes(protocol!)
-          && authorizedModels.has(model.id)).length;
-      };
-      group = eligibleGroups.sort((left, right) =>
-        score(right) - score(left)
-          || Number(right.id === requestedGroup.id) - Number(left.id === requestedGroup.id),
-      )[0]!;
     }
     const protocol = parsed.protocol ?? group.defaultProtocol;
     if (!protocol || !group.protocols.includes(protocol)) {
@@ -410,6 +538,21 @@ export class ControlPlane {
 
     let serverUrl: string | undefined;
     if (parsed.harness === "opencode") {
+      const actual = await this.providerGateway.verifyModels(enabledModels.map((model) => {
+        const slash = model.model.indexOf("/");
+        return {
+          providerId: model.model.slice(0, slash),
+          modelId: model.model.slice(slash + 1),
+          ...(model.reasoningEffort ? { reasoningEffort: model.reasoningEffort } : {}),
+        };
+      }));
+      const failedActual = actual.filter((result) => !result.ready);
+      if (failedActual.length > 0) {
+        const details = failedActual.slice(0, 8)
+          .map((result) => `${result.providerId}/${result.modelId}：${result.error}`)
+          .join("；");
+        throw new InputError(`模型真实调用验证未通过：${details}`);
+      }
       const providers = await this.providerGateway.listProviders();
       const invalid = validateModelAccess(enabledModels, providers).filter((check) => !check.ready);
       if (invalid.length > 0) {
@@ -436,11 +579,12 @@ export class ControlPlane {
       this.configsDir,
       `${new Date().toISOString().replace(/[:.]/g, "-")}-${randomUUID()}.json`,
     );
+    const modelsWithBillingSnapshots = await this.attachPackyBillingSnapshots(parsed.models);
     const rawConfig = {
       version: 1,
       name: parsed.name,
       dataset: { dir: datasetDir, include: [] },
-      models: parsed.models,
+      models: modelsWithBillingSnapshots,
       runtime: {
         harness: parsed.harness,
         stageMode: parsed.stageMode,
@@ -449,6 +593,7 @@ export class ControlPlane {
         outputDir: this.options.outputDir,
         dataDir: this.options.dataDir,
         roundTimeoutMs: parsed.roundTimeoutMs,
+        roundIdleTimeoutMs: parsed.roundIdleTimeoutMs,
         maxAttempts: parsed.maxAttempts,
         retryBackoffMs: parsed.retryBackoffMs,
         ...(this.options.workspaceTemplate
@@ -481,12 +626,97 @@ export class ControlPlane {
     };
   }
 
+  private async attachPackyBillingSnapshots(
+    models: Array<z.infer<typeof experimentModelSchema>>,
+  ): Promise<Array<z.infer<typeof experimentModelSchema> & {
+    billingSnapshot?: ResolvedBenchmarkConfig["models"][number]["billingSnapshot"];
+  }>> {
+    const packyProviderIds = new Set(models
+      .filter((model) => model.enabled)
+      .map((model) => model.model.slice(0, model.model.indexOf("/")))
+      .filter((providerId) => providerId.startsWith("packy-")));
+    if (packyProviderIds.size === 0) return models;
+
+    const [catalog, providers] = await Promise.all([
+      this.providerGateway.listPackyCatalog(),
+      this.providerGateway.listPackyProviders(),
+    ]);
+    const providerById = new Map(providers.map((provider) => [provider.providerId, provider]));
+    const catalogModelById = new Map(catalog.models.map((model) => [model.id, model]));
+    return models.map((model) => {
+      const slash = model.model.indexOf("/");
+      const providerId = model.model.slice(0, slash);
+      if (!model.enabled || !packyProviderIds.has(providerId)) return model;
+      const provider = providerById.get(providerId);
+      if (!provider?.group) {
+        throw new InputError(`PackyAPI 供应商 ${providerId} 缺少明确的计费分组，无法保存费用快照`);
+      }
+      const modelId = model.model.slice(slash + 1);
+      const catalogModel = catalogModelById.get(modelId);
+      if (!catalogModel || !catalogModel.groups.includes(provider.group)) {
+        throw new InputError(
+          `PackyAPI 目录中找不到 ${provider.group} 分组下的模型 ${modelId}，无法保存费用快照`,
+        );
+      }
+      return {
+        ...model,
+        billingSnapshot: {
+          provider: "packy" as const,
+          group: provider.group,
+          catalogSource: catalog.source,
+          catalogFetchedAt: catalog.fetchedAt,
+          pricing: structuredClone(catalogModel.pricing ?? {}),
+        },
+      };
+    });
+  }
+
+  private async loadDatasetModelSelections(): Promise<void> {
+    if (this.datasetModelSelectionsLoaded) return;
+    this.datasetModelSelectionsLoaded = true;
+    const statePath = path.join(this.options.dataDir, "dataset-model-selections.json");
+    try {
+      const raw = JSON.parse(await readFile(statePath, "utf8")) as { selections?: unknown };
+      const selections = raw && typeof raw === "object" && raw.selections
+        && typeof raw.selections === "object" && !Array.isArray(raw.selections)
+        ? raw.selections as Record<string, unknown>
+        : {};
+      this.datasetModelSelections = Object.fromEntries(Object.entries(selections).flatMap(([datasetId, value]) => {
+        const parsed = z.object({
+          datasetId: identifierSchema,
+          updatedAt: z.number(),
+          models: z.array(datasetDraftModelSchema).max(100),
+        }).safeParse(value);
+        return parsed.success && parsed.data.datasetId === datasetId ? [[datasetId, parsed.data]] : [];
+      }));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+
+  private async persistDatasetModelSelections(): Promise<void> {
+    const statePath = path.join(this.options.dataDir, "dataset-model-selections.json");
+    await mkdir(path.dirname(statePath), { recursive: true });
+    const temporaryPath = `${statePath}.${process.pid}.${Date.now()}.tmp`;
+    await writeFile(temporaryPath, `${JSON.stringify({
+      version: 1,
+      selections: this.datasetModelSelections,
+    }, null, 2)}\n`, "utf8");
+    await rename(temporaryPath, statePath);
+  }
+
   close(): void {
     this.providerGateway.close();
   }
 }
 
 export class InputError extends Error {}
+
+function normalizeAggregatorBaseUrl(value: string): string {
+  const url = new URL(value);
+  url.pathname = url.pathname.replace(/\/+$/, "").replace(/\/models$/i, "") || "/";
+  return url.toString().replace(/\/+$/, "");
+}
 
 function safeUploadPath(value: string): string {
   const normalized = value.replaceAll("\\", "/").replace(/^\.\//, "");

@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { OpencodeClient } from "@opencode-ai/sdk";
@@ -29,6 +29,8 @@ describe("OpenCode harness message errors", () => {
 
     expect(system).toContain(path.resolve(workspacePath));
     expect(system).toContain("唯一允许");
+    expect(system).toContain("不得引用 http://、https://");
+    expect(system).toContain("先检查工作区现有文件");
     expect(isPathInsideWorkspace(workspacePath, childPath)).toBe(true);
     expect(isPathInsideWorkspace(workspacePath, "index.html")).toBe(true);
     expect(isPathInsideWorkspace(workspacePath, siblingPath)).toBe(false);
@@ -98,11 +100,109 @@ describe("OpenCode harness message errors", () => {
       );
       expect(result).toMatchObject({
         response: "generation complete",
-        usage: { input: 12, output: 3, reasoning: 2, cost: 0.01 },
+        usage: {
+          input: 12,
+          output: 3,
+          reasoning: 2,
+          cacheRead: 7,
+          cacheWrite: 4,
+          cost: 0.01,
+        },
       });
       expect(state.accepted).toBe(true);
       expect(state.promptCalled).toBe(false);
       expect(state.statusCalls).toBeGreaterThanOrEqual(2);
+    } finally {
+      await harness.stop();
+    }
+  });
+
+  it("continues an unknown finish in the same session and preserves its workspace", async () => {
+    const workspacePath = await createWorkspace("<main>Replace this page with the generated game.</main>");
+    const state: FakeState = {
+      accepted: false,
+      promptCalled: false,
+      statusCalls: 0,
+      onPrompt: async (call) => {
+        if (call === 2) {
+          await writeFile(
+            path.join(workspacePath, "index.html"),
+            "<main>continued game</main><script>window.game = true;</script>",
+            "utf8",
+          );
+        }
+      },
+    };
+    const client = fakeClient(state, (promptCalls) => promptCalls <= 1
+      ? emptyMessages("assistant-1")
+      : [...emptyMessages("assistant-1"), ...completedMessages("assistant-2")]);
+    const harness = new OpenCodeHarness(openCodeConfig(), "system", {
+      connect: async () => ({ client, server: null, url: "http://127.0.0.1:4096" }),
+      pollIntervalMs: 1,
+    });
+    await harness.start();
+    try {
+      await expect(harness.executeRound(
+        runContext(workspacePath),
+        "session-1",
+        round(),
+        0,
+      )).resolves.toMatchObject({ response: "generation complete" });
+      expect(state.promptCalls).toBe(2);
+      expect(await readFile(path.join(workspacePath, "index.html"), "utf8")).toContain("continued game");
+    } finally {
+      await harness.stop();
+    }
+  });
+
+  it("stops after three unknown-finish continuations", async () => {
+    const workspacePath = await createWorkspace("<main>Replace this page with the generated game.</main>");
+    const state: FakeState = { accepted: false, promptCalled: false, statusCalls: 0 };
+    const client = fakeClient(state, (promptCalls) => Array.from(
+      { length: promptCalls },
+      (_, index) => emptyMessages(`assistant-${index + 1}`)[0],
+    ));
+    const harness = new OpenCodeHarness(openCodeConfig(), "system", {
+      connect: async () => ({ client, server: null, url: "http://127.0.0.1:4096" }),
+      pollIntervalMs: 1,
+    });
+    await harness.start();
+    try {
+      await expect(harness.executeRound(
+        runContext(workspacePath),
+        "session-1",
+        round(),
+        0,
+      )).rejects.toThrow("连续异常结束");
+      expect(state.promptCalls).toBe(4);
+    } finally {
+      await harness.stop();
+    }
+  });
+
+  it("aborts a model that stays busy without producing execution events", async () => {
+    const workspacePath = await createWorkspace("<main>generated game</main><script>window.game = true;</script>");
+    const state: FakeState = {
+      accepted: false,
+      promptCalled: false,
+      statusCalls: 0,
+      stuckBusy: true,
+    };
+    const client = fakeClient(state, completedMessages());
+    const harness = new OpenCodeHarness(openCodeConfig(), "system", {
+      connect: async () => ({ client, server: null, url: "http://127.0.0.1:4096" }),
+      pollIntervalMs: 1,
+      idleTimeoutMs: 5,
+    });
+    await harness.start();
+    try {
+      await expect(harness.executeRound(
+        runContext(workspacePath),
+        "session-1",
+        round(),
+        0,
+      )).rejects.toThrow("空闲超时");
+      expect(state.statusCalls).toBeGreaterThanOrEqual(1);
     } finally {
       await harness.stop();
     }
@@ -153,19 +253,25 @@ describe("OpenCode harness message errors", () => {
 
 function fakeClient(
   state: FakeState,
-  messages: unknown[],
+  messages: unknown[] | ((promptCalls: number) => unknown[]),
   events: unknown[] = [],
 ): OpencodeClient {
   return {
     session: {
-      messages: async () => ({ data: state.accepted ? messages : [] }),
+      messages: async () => ({
+        data: state.accepted
+          ? typeof messages === "function" ? messages(state.promptCalls ?? 0) : messages
+          : [],
+      }),
       prompt: async () => {
         state.promptCalled = true;
         throw new Error("synchronous prompt must not be used");
       },
       promptAsync: async (options: { body?: { system?: string } }) => {
         state.accepted = true;
+        state.promptCalls = (state.promptCalls ?? 0) + 1;
         state.systemPrompt = options.body?.system;
+        await state.onPrompt?.(state.promptCalls);
         return { data: undefined };
       },
       abort: async () => {
@@ -180,7 +286,7 @@ function fakeClient(
         state.statusCalls += 1;
         return {
           data: {
-            "session-1": { type: state.statusCalls === 1 ? "busy" : "idle" },
+            "session-1": { type: state.stuckBusy || state.statusCalls === 1 ? "busy" : "idle" },
           },
         };
       },
@@ -205,30 +311,33 @@ interface FakeState {
   systemPrompt?: string | undefined;
   deletedSessions?: number;
   disposedInstances?: number;
+  stuckBusy?: boolean;
+  promptCalls?: number;
+  onPrompt?: (call: number) => void | Promise<void>;
 }
 
 async function* eventStream(events: unknown[]): AsyncGenerator<unknown> {
   for (const event of events) yield event;
 }
 
-function completedMessages(): unknown[] {
+function completedMessages(id = "assistant-1"): unknown[] {
   return [{
-    info: assistantInfo("stop", 12, 3, 2, 0.01),
+    info: assistantInfo("stop", 12, 3, 2, 0.01, id),
     parts: [
       { type: "text", text: "generation complete" },
       {
         type: "step-finish",
         reason: "stop",
         cost: 0.01,
-        tokens: { input: 12, output: 3, reasoning: 2, cache: { read: 0, write: 0 } },
+        tokens: { input: 12, output: 3, reasoning: 2, cache: { read: 7, write: 4 } },
       },
     ],
   }];
 }
 
-function emptyMessages(): unknown[] {
+function emptyMessages(id = "assistant-1"): unknown[] {
   return [{
-    info: assistantInfo("unknown", 0, 0, 0, 0),
+    info: assistantInfo("unknown", 0, 0, 0, 0, id),
     parts: [{
       type: "step-finish",
       reason: "unknown",
@@ -244,9 +353,10 @@ function assistantInfo(
   output: number,
   reasoning: number,
   cost: number,
+  id = "assistant-1",
 ): Record<string, unknown> {
   return {
-    id: "assistant-1",
+    id,
     sessionID: "session-1",
     role: "assistant",
     time: { created: 1, completed: 2 },
@@ -298,6 +408,7 @@ function runContext(workspacePath: string, provider = "provider"): HarnessRunCon
       totalRounds: 1,
       attempt: 1,
       maxAttempts: 1,
+      resumePending: false,
       availableAt: 0,
       workspacePath,
       sessionId: "session-1",

@@ -1,11 +1,13 @@
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { ControlPlane } from "../src/control-plane.js";
 import { BenchmarkDatabase } from "../src/database.js";
 import { OrchestratorManager } from "../src/manager.js";
 import type {
+  AggregatorProviderConfiguration,
+  AggregatorProviderSummary,
   PackyCatalog,
   PackyProviderConfiguration,
   PackyProviderSummary,
@@ -33,6 +35,10 @@ describe("web control plane", () => {
     const packyWrites: PackyProviderConfiguration[] = [];
     const packyKeyChecks: string[] = [];
     const packyProviders: PackyProviderSummary[] = [];
+    const aggregatorWrites: AggregatorProviderConfiguration[] = [];
+    const aggregatorKeyChecks: Array<{ baseUrl: string; apiKey: string }> = [];
+    const aggregatorProviders: AggregatorProviderSummary[] = [];
+    const verificationRequests: Array<Array<{ providerId: string; modelId: string }>> = [];
     const packyCatalog: PackyCatalog = {
       source: "https://www.packyapi.ai/api/pricing",
       fetchedAt: 1234,
@@ -89,6 +95,13 @@ describe("web control plane", () => {
         endpoints: ["openai", "anthropic"],
         protocols: ["openai", "anthropic"],
         sourceGeneration: true,
+        pricing: {
+          quotaType: 0,
+          modelRatio: "0.5",
+          modelPrice: "0",
+          completionRatio: "4",
+          tiers: [{ min: 0, max: 1_000_000 }],
+        },
       }, {
         id: "deepseek-v4-pro",
         name: "deepseek-v4-pro",
@@ -98,6 +111,7 @@ describe("web control plane", () => {
         endpoints: ["openai", "anthropic"],
         protocols: ["openai", "anthropic"],
         sourceGeneration: true,
+        pricing: { quotaType: 0, modelRatio: "1", completionRatio: "4" },
       }],
     };
     const providerGateway = {
@@ -119,6 +133,13 @@ describe("web control plane", () => {
             reasoningEfforts: ["low", "high"],
             status: "active",
           }, {
+            id: "probe-fail",
+            name: "Probe Failure",
+            toolCall: true,
+            reasoning: false,
+            reasoningEfforts: [],
+            status: "active",
+          }, {
             id: "text-only",
             name: "Text Only",
             toolCall: false,
@@ -126,7 +147,7 @@ describe("web control plane", () => {
             reasoningEfforts: [],
             status: "active",
           }],
-        }, ...packyProviders.map((provider) => ({
+        }, ...[...packyProviders, ...aggregatorProviders].map((provider) => ({
           id: provider.providerId,
           name: provider.name,
           connected: provider.connected,
@@ -172,6 +193,58 @@ describe("web control plane", () => {
         else packyProviders.push(summary);
         return summary;
       },
+      async listAggregatorProviders() {
+        return aggregatorProviders;
+      },
+      async discoverAggregatorModels(baseUrl: string, apiKey: string) {
+        aggregatorKeyChecks.push({ baseUrl, apiKey });
+        return {
+          models: [
+            { id: "openai/gpt-5", name: "GPT 5" },
+            { id: "anthropic/claude-sonnet", name: "Claude Sonnet" },
+          ],
+          discoveredModelCount: 3,
+          rejectedModelCount: 1,
+        };
+      },
+      async configureAggregatorProvider(input: AggregatorProviderConfiguration) {
+        aggregatorWrites.push(input);
+        const summary: AggregatorProviderSummary = {
+          providerId: input.providerId,
+          name: input.name,
+          baseUrl: input.baseUrl,
+          connected: true,
+          models: input.models.map((model) => ({ ...model, toolCall: true })),
+          discoveredModelCount: input.discoveredModelCount ?? input.models.length,
+          rejectedModelCount: Math.max(
+            0,
+            (input.discoveredModelCount ?? input.models.length) - input.models.length,
+          ),
+        };
+        const existingIndex = aggregatorProviders.findIndex(
+          (provider) => provider.providerId === input.providerId,
+        );
+        if (existingIndex >= 0) aggregatorProviders[existingIndex] = summary;
+        else aggregatorProviders.push(summary);
+        return summary;
+      },
+      async listModelVerifications() { return []; },
+      async verifyModels(requests: Array<{ providerId: string; modelId: string }>) {
+        verificationRequests.push(requests);
+        return requests.map((request) => ({
+          ...request,
+          ready: request.modelId !== "probe-fail",
+          cached: false,
+          error: request.modelId === "probe-fail" ? "工具探针未执行" : "",
+          ...(request.modelId === "probe-fail" ? {} : { record: {
+            ...request,
+            verifiedAt: Date.now(),
+            expiresAt: Date.now() + 60_000,
+            method: "opencode" as const,
+            latencyMs: 1,
+          } }),
+        }));
+      },
       async setApiKey(providerId: string, key: string) {
         credentialWrites.push({ providerId, key });
       },
@@ -202,6 +275,17 @@ describe("web control plane", () => {
       { hostname: "127.0.0.1", port: 0 },
     );
     const url = await dashboard.start();
+    const originalFetch = globalThis.fetch;
+    const setup = await originalFetch(`${url}/api/setup`).then((response) => response.json()) as {
+      csrfToken: string;
+    };
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation((input, init) => {
+      const headers = new Headers(init?.headers);
+      if (init?.method && !["GET", "HEAD", "OPTIONS"].includes(init.method.toUpperCase())) {
+        headers.set("X-GameBench-CSRF", setup.csrfToken);
+      }
+      return originalFetch(input, { ...init, headers });
+    });
 
     try {
       const datasetResponse = await fetch(`${url}/api/datasets/import`, {
@@ -218,6 +302,35 @@ describe("web control plane", () => {
       expect(datasetResponse.status).toBe(201);
       const dataset = await datasetResponse.json() as { id: string; taskCount: number };
       expect(dataset.taskCount).toBe(2);
+      await expect(controlPlane.importDataset({
+        name: "Unsafe references",
+        files: [{
+          path: "unsafe.json",
+          content: JSON.stringify({
+            id: "unsafe-game",
+            seedDir: "C:/Windows",
+            rounds: [{ prompt: "Should never import" }],
+          }),
+        }],
+      })).rejects.toThrow("网页上传题库不允许使用 seedDir");
+      const draftResponse = await fetch(`${url}/api/datasets/${dataset.id}/models`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          models: [
+            { id: "game-model", model: "vendor-a/game-model", enabled: true, concurrency: 3 },
+            { id: "", model: "", enabled: true, concurrency: 1 },
+          ],
+        }),
+      });
+      expect(draftResponse.status).toBe(200);
+      expect(await draftResponse.json()).toMatchObject({
+        datasetId: dataset.id,
+        models: [
+          { id: "game-model", model: "vendor-a/game-model", concurrency: 3 },
+          { id: "", model: "", concurrency: 1 },
+        ],
+      });
 
       const aggregateDatasetResponse = await fetch(`${url}/api/datasets/import`, {
         method: "POST",
@@ -279,6 +392,45 @@ describe("web control plane", () => {
       });
       expect(credentialResponse.status).toBe(200);
       expect(credentialWrites).toEqual([{ providerId: "vendor-a", key: "test-secret" }]);
+
+      const emptyAggregatorResponse = await fetch(`${url}/api/providers/aggregators`);
+      expect(await emptyAggregatorResponse.json()).toEqual([]);
+      const aggregatorResponse = await fetch(`${url}/api/providers/aggregators/connect`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: "Team Gateway",
+          baseUrl: "https://gateway.example.com/v1/models/",
+          apiKey: "aggregate-test-secret",
+        }),
+      });
+      expect(aggregatorResponse.status).toBe(201);
+      const configuredAggregator = await aggregatorResponse.json() as AggregatorProviderSummary;
+      expect(configuredAggregator).toMatchObject({
+        providerId: "aggregate-gateway.example.com-v1",
+        name: "Team Gateway",
+        baseUrl: "https://gateway.example.com/v1",
+        connected: true,
+        discoveredModelCount: 3,
+        rejectedModelCount: 1,
+        models: [
+          expect.objectContaining({ id: "openai/gpt-5" }),
+          expect.objectContaining({ id: "anthropic/claude-sonnet" }),
+        ],
+      });
+      expect(JSON.stringify(configuredAggregator)).not.toContain("aggregate-test-secret");
+      expect(aggregatorKeyChecks).toEqual([{
+        baseUrl: "https://gateway.example.com/v1",
+        apiKey: "aggregate-test-secret",
+      }]);
+      expect(aggregatorWrites).toEqual([expect.objectContaining({
+        providerId: "aggregate-gateway.example.com-v1",
+        apiKey: "aggregate-test-secret",
+        models: expect.arrayContaining([
+          expect.objectContaining({ id: "openai/gpt-5" }),
+          expect.objectContaining({ id: "anthropic/claude-sonnet" }),
+        ]),
+      })]);
 
       const emptyPackyResponse = await fetch(`${url}/api/providers/packy`);
       expect(await emptyPackyResponse.json()).toEqual([]);
@@ -353,17 +505,27 @@ describe("web control plane", () => {
       });
       expect(targetPackyResponse.status).toBe(201);
       expect(await targetPackyResponse.json()).toMatchObject({
-        providerId: "packy-codex",
-        group: "codex",
-        models: expect.arrayContaining([
-          expect.objectContaining({ id: "gpt-5.2" }),
-          expect.objectContaining({ id: "gpt-5.2-codex" }),
-        ]),
+        providerId: "packy-azure-officially",
+        group: "azure-officially",
+        models: [expect.objectContaining({ id: "gpt-5.2" })],
       });
       expect(packyWrites[2]).toMatchObject({
-        providerId: "packy-codex",
-        group: "codex",
+        providerId: "packy-azure-officially",
+        group: "azure-officially",
         apiKey: "packy-codex-target-secret",
+      });
+      const mismatchedGroupResponse = await fetch(`${url}/api/providers/packy/connect`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          group: "azure-officially",
+          targetModelId: "gpt-5.2-codex",
+          apiKey: "packy-mismatched-group-secret",
+        }),
+      });
+      expect(mismatchedGroupResponse.status).toBe(400);
+      expect(await mismatchedGroupResponse.json()).toMatchObject({
+        error: expect.stringContaining("不属于所选计费分组 Azure Officially"),
       });
       const wrongTargetResponse = await fetch(`${url}/api/providers/packy/connect`, {
         method: "POST",
@@ -381,8 +543,37 @@ describe("web control plane", () => {
       expect(packyKeyChecks).toEqual([
         "packy-deepseek-secret",
         "packy-codex-target-secret",
+        "packy-mismatched-group-secret",
         "packy-wrong-target-secret",
       ]);
+
+      const { experiment: billingExperiment } = await controlPlane.createExperiment({
+        name: "Packy billing snapshot",
+        datasetId: dataset.id,
+        harness: "mock",
+        models: [{
+          id: "deepseek-flash",
+          model: "packy-deepseek-officially/deepseek-v4-flash",
+          enabled: true,
+          concurrency: 1,
+        }],
+        globalConcurrency: 1,
+      });
+      await waitFor(() => db.getExperiment(billingExperiment.id)?.status === "completed");
+      expect(db.getExperiment(billingExperiment.id)?.config.models[0]?.billingSnapshot)
+        .toEqual({
+          provider: "packy",
+          group: "deepseek-officially",
+          catalogSource: "https://www.packyapi.ai/api/pricing",
+          catalogFetchedAt: 1234,
+          pricing: {
+            quotaType: 0,
+            modelRatio: "0.5",
+            modelPrice: "0",
+            completionRatio: "4",
+            tiers: [{ min: 0, max: 1_000_000 }],
+          },
+        });
       const duplicateProviderResponse = await fetch(`${url}/api/providers/packy`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -407,6 +598,33 @@ describe("web control plane", () => {
       });
       expect(await readyResponse.json()).toMatchObject({
         checks: [expect.objectContaining({ id: "ready", status: "ready", ready: true })],
+      });
+      const actualVerificationResponse = await fetch(`${url}/api/models/verify`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          force: true,
+          models: [{ id: "ready", model: "vendor-a/game-model", enabled: true, concurrency: 1 }],
+        }),
+      });
+      expect(await actualVerificationResponse.json()).toMatchObject({
+        results: [expect.objectContaining({ providerId: "vendor-a", modelId: "game-model", ready: true })],
+      });
+
+      const failedProbeResponse = await fetch(`${url}/api/experiments`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: "Probe must pass",
+          datasetId: dataset.id,
+          harness: "opencode",
+          models: [{ id: "probe-fail", model: "vendor-a/probe-fail", enabled: true, concurrency: 1 }],
+          globalConcurrency: 1,
+        }),
+      });
+      expect(failedProbeResponse.status).toBe(400);
+      expect(await failedProbeResponse.json()).toMatchObject({
+        error: expect.stringContaining("模型真实调用验证未通过"),
       });
 
       const invalidRealResponse = await fetch(`${url}/api/experiments`, {
@@ -459,7 +677,9 @@ describe("web control plane", () => {
         },
       });
       expect(experiment.outputDir).toBe(path.join(directory, "runs", experiment.id));
-      expect(db.getExperiment(experiment.id)?.config.runtime.roundTimeoutMs).toBe(0);
+      expect(db.getExperiment(experiment.id)?.config.runtime.roundTimeoutMs).toBe(60_000);
+      expect(db.getExperiment(experiment.id)?.config.runtime.roundIdleTimeoutMs)
+        .toBe(30 * 60 * 1000);
       expect(JSON.stringify(db.getExperiment(experiment.id)?.config)).not.toContain("test-secret");
 
       await waitFor(() => db.getExperiment(experiment.id)?.status === "completed");
@@ -499,10 +719,23 @@ describe("web control plane", () => {
       }
 
       const setupResponse = await fetch(`${url}/api/setup`);
-      const setup = await setupResponse.json() as { datasets: Array<{ id: string }>; outputDir: string };
+      const setup = await setupResponse.json() as {
+        datasets: Array<{ id: string }>;
+        modelSelections: Record<string, { models: Array<{ id: string; model: string }> }>;
+        outputDir: string;
+      };
       expect(setup.datasets.some((item) => item.id === dataset.id)).toBe(true);
+      expect(setup.modelSelections[dataset.id]?.models).toEqual([
+        expect.objectContaining({ id: "game-model", model: "vendor-a/game-model" }),
+        expect.objectContaining({ id: "", model: "" }),
+      ]);
       expect(setup.outputDir).toBe(path.join(directory, "runs"));
+      expect(verificationRequests).toEqual(expect.arrayContaining([
+        [expect.objectContaining({ providerId: "vendor-a", modelId: "game-model" })],
+        [expect.objectContaining({ providerId: "vendor-a", modelId: "probe-fail" })],
+      ]));
     } finally {
+      fetchSpy.mockRestore();
       await manager.shutdown();
       await dashboard.close();
       controlPlane.close();

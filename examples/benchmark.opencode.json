@@ -26,6 +26,7 @@
     "outputDir": "../runs/opencode",
     "dataDir": "../.gamebench/opencode",
     "roundTimeoutMs": 0,
+    "roundIdleTimeoutMs": 1800000,
     "maxAttempts": 3,
     "retryBackoffMs": 60000
   },

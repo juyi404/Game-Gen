@@ -74,7 +74,8 @@ describe("generation orchestrator", () => {
               index: number;
               status: string;
               error: string | null;
-              timeoutMs: null;
+              timeoutMs: number | null;
+              idleTimeoutMs: number | null;
               unlimited: boolean;
             };
             request: { userPrompt: { original: string; rendered: string } };
@@ -88,6 +89,7 @@ describe("generation orchestrator", () => {
             status: "completed",
             error: null,
             timeoutMs: null,
+            idleTimeoutMs: loaded.config.runtime.roundIdleTimeoutMs,
             unlimited: true,
           });
           expect(context.request.userPrompt.original).toBe(
@@ -99,6 +101,8 @@ describe("generation orchestrator", () => {
             input: roundIndex + 1,
             output: roundIndex + 2,
             reasoning: roundIndex + 3,
+            cacheRead: 0,
+            cacheWrite: 0,
             cost: roundIndex / 100,
           });
           expect(context.contextBeforeRound).toHaveLength(roundIndex * 2);
@@ -388,12 +392,191 @@ describe("generation orchestrator", () => {
       expect(db.getSummary(experiment.id)).toMatchObject({ queued: 4, retrying: 2, failed: 0 });
       const attempted = db.listRuns(experiment.id).filter((run) => run.attempt === 1);
       expect(attempted).toHaveLength(2);
-      expect(attempted.every((run) => run.maxAttempts === 2)).toBe(true);
+      expect(attempted.every((run) => run.maxAttempts === 1)).toBe(true);
+      expect(attempted.every(
+        (run) => db.getInfrastructureRetryState(run.id).attempts === 1,
+      )).toBe(true);
       expect(db.listEvents({ experimentId: experiment.id }).some(
         (event) => event.type === "experiment.dispatch.cooldown",
       )).toBe(true);
     } finally {
       await orchestrator.shutdown();
+      db.close();
+    }
+  });
+
+  it("isolates a provider outage while healthy providers keep running", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "gamebench-provider-circuit-"));
+    temporaryDirectories.push(directory);
+    const loaded = await loadBenchmarkConfig(path.resolve("examples/benchmark.mock.json"));
+    const baseTask = loaded.tasks[0]!;
+    const tasks = Array.from({ length: 2 }, (_, index) => ({
+      ...baseTask,
+      id: `provider-task-${index + 1}`,
+      title: `Provider task ${index + 1}`,
+    }));
+    loaded.config.models = [
+      model("blocked-model", "provider-a", 2),
+      model("healthy-model", "provider-b", 2),
+    ];
+    loaded.config.runtime.globalConcurrency = 2;
+    loaded.config.runtime.maxAttempts = 1;
+    loaded.config.runtime.outputDir = path.join(directory, "runs");
+    loaded.config.runtime.dataDir = path.join(directory, "data");
+    const db = new BenchmarkDatabase(path.join(directory, "benchmark.sqlite"));
+    const experiment = db.createExperiment(loaded.config, tasks);
+    const orchestrator = new GenerationOrchestrator(
+      db,
+      experiment,
+      loaded.config,
+      tasks,
+      new ProviderIsolationHarness(),
+    );
+    try {
+      await orchestrator.start();
+      await waitFor(() => db.getSummary(experiment.id).completed === 2);
+      expect(db.getModelRunSummaries(experiment.id)).toEqual(expect.arrayContaining([
+        expect.objectContaining({ providerId: "provider-b", completed: 2 }),
+        expect.objectContaining({ providerId: "provider-a", completed: 0 }),
+      ]));
+      expect(db.listEvents({ experimentId: experiment.id }).some((event) =>
+        event.type === "experiment.dispatch.cooldown" &&
+        event.data.scope === "provider" &&
+        event.data.providerId === "provider-a"
+      )).toBe(true);
+    } finally {
+      await orchestrator.shutdown();
+      db.close();
+    }
+  });
+
+  it("pauses immediately on exhausted provider quota without burning attempt budgets", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "gamebench-provider-quota-"));
+    temporaryDirectories.push(directory);
+    const loaded = await loadBenchmarkConfig(path.resolve("examples/benchmark.mock.json"));
+    const baseTask = loaded.tasks[0]!;
+    const tasks = Array.from({ length: 4 }, (_, index) => ({
+      ...baseTask,
+      id: `quota-task-${index + 1}`,
+      title: `Quota task ${index + 1}`,
+    }));
+    loaded.config.models = loaded.config.models.slice(0, 1).map((item) => ({
+      ...item,
+      concurrency: 2,
+    }));
+    loaded.config.runtime.globalConcurrency = 2;
+    loaded.config.runtime.maxAttempts = 5;
+    loaded.config.runtime.retryBackoffMs = 1;
+    loaded.config.runtime.outputDir = path.join(directory, "runs");
+    loaded.config.runtime.dataDir = path.join(directory, "data");
+    const db = new BenchmarkDatabase(path.join(directory, "benchmark.sqlite"));
+    const experiment = db.createExperiment(loaded.config, tasks);
+    const orchestrator = new GenerationOrchestrator(
+      db,
+      experiment,
+      loaded.config,
+      tasks,
+      new QuotaFailureHarness(),
+    );
+    try {
+      await orchestrator.start();
+      await waitFor(() => db.getExperiment(experiment.id)?.status === "paused" && orchestrator.activeCount === 0);
+      expect(db.getSummary(experiment.id)).toMatchObject({
+        queued: 2,
+        retrying: 2,
+        failed: 0,
+      });
+      const blockedRuns = db.listRuns(experiment.id).filter((run) => run.status === "retrying");
+      expect(blockedRuns).toHaveLength(2);
+      expect(blockedRuns.every((run) =>
+        run.attempt === 1 &&
+        run.resumePending &&
+        run.workspacePath !== null &&
+        run.sessionId !== null
+      )).toBe(true);
+      const events = db.listEvents({ experimentId: experiment.id });
+      expect(events.filter((event) => event.type === "experiment.provider.blocked")).toHaveLength(1);
+      expect(events.filter((event) => event.type === "run.provider.blocked")).toHaveLength(2);
+      expect(events.some((event) => event.type === "run.retrying")).toBe(false);
+    } finally {
+      await orchestrator.shutdown();
+      db.close();
+    }
+  });
+
+  it("keeps filling concurrency when unknown finishes only require per-run continuation", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "gamebench-unknown-finish-refill-"));
+    temporaryDirectories.push(directory);
+    const loaded = await loadBenchmarkConfig(path.resolve("examples/benchmark.mock.json"));
+    const baseTask = loaded.tasks[0]!;
+    const tasks = Array.from({ length: 2 }, (_, index) => ({
+      ...baseTask,
+      id: `unknown-finish-task-${index + 1}`,
+      title: `Unknown finish task ${index + 1}`,
+    }));
+    loaded.config.models = loaded.config.models.slice(0, 1).map((item) => ({
+      ...item,
+      concurrency: 2,
+    }));
+    loaded.config.runtime.globalConcurrency = 2;
+    loaded.config.runtime.maxAttempts = 1;
+    loaded.config.runtime.retryBackoffMs = 1;
+    loaded.config.runtime.outputDir = path.join(directory, "runs");
+    loaded.config.runtime.dataDir = path.join(directory, "data");
+    const db = new BenchmarkDatabase(path.join(directory, "benchmark.sqlite"));
+    const experiment = db.createExperiment(loaded.config, tasks);
+    const orchestrator = new GenerationOrchestrator(
+      db,
+      experiment,
+      loaded.config,
+      tasks,
+      new UnknownFinishOnceHarness(),
+    );
+    try {
+      await orchestrator.start();
+      expect((await orchestrator.waitForCompletion()).status).toBe("completed");
+      expect(db.getSummary(experiment.id)).toMatchObject({ completed: 2, failed: 0, retrying: 0 });
+      expect(db.listRuns(experiment.id).every((run) => run.attempt === 1)).toBe(true);
+      const events = db.listEvents({ experimentId: experiment.id });
+      expect(events.filter((event) => event.type === "run.continuation.retrying")).toHaveLength(2);
+      expect(events.some((event) => event.type === "experiment.dispatch.cooldown")).toBe(false);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("enforces the configured round hard timeout as a normal finite failure", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "gamebench-round-timeout-"));
+    temporaryDirectories.push(directory);
+    const loaded = await loadBenchmarkConfig(path.resolve("examples/benchmark.mock.json"));
+    loaded.config.models = loaded.config.models.slice(0, 1);
+    loaded.tasks = loaded.tasks.slice(0, 1);
+    loaded.config.runtime.globalConcurrency = 1;
+    loaded.config.runtime.maxAttempts = 1;
+    loaded.config.runtime.roundTimeoutMs = 25;
+    loaded.config.runtime.outputDir = path.join(directory, "runs");
+    loaded.config.runtime.dataDir = path.join(directory, "data");
+    const db = new BenchmarkDatabase(path.join(directory, "benchmark.sqlite"));
+    const experiment = db.createExperiment(loaded.config, loaded.tasks);
+    const orchestrator = new GenerationOrchestrator(
+      db,
+      experiment,
+      loaded.config,
+      loaded.tasks,
+      new RoundTimeoutHarness(),
+    );
+    try {
+      await orchestrator.start();
+      const completed = await orchestrator.waitForCompletion();
+      expect(completed.status).toBe("failed");
+      expect(db.getSummary(experiment.id)).toMatchObject({ failed: 1, retrying: 0 });
+      expect(db.listEvents({ experimentId: experiment.id }).some((event) =>
+        event.type === "run.failed" && event.data.error === "轮次执行超过硬超时 25ms"
+      )).toBe(true);
+      expect(db.listEvents({ experimentId: experiment.id }).some((event) =>
+        event.type === "run.infrastructure.retrying"
+      )).toBe(false);
+    } finally {
       db.close();
     }
   });
@@ -491,6 +674,8 @@ class TrackingHarness implements GenerationHarness {
         input: roundIndex + 1,
         output: roundIndex + 2,
         reasoning: roundIndex + 3,
+        cacheRead: 0,
+        cacheWrite: 0,
         cost: roundIndex / 100,
       },
     };
@@ -561,6 +746,79 @@ class InfrastructureFailureHarness implements GenerationHarness {
   }
   async executeRound(): Promise<HarnessRoundResult> {
     throw new Error("unexpected round execution");
+  }
+  async abortRun(): Promise<void> {}
+  async releaseRun(): Promise<void> {}
+}
+
+class ProviderIsolationHarness implements GenerationHarness {
+  async start(): Promise<void> {}
+  async stop(): Promise<void> {}
+  async beginRun(context: HarnessRunContext): Promise<string> {
+    return `provider-session-${context.run.id}`;
+  }
+  async executeRound(context: HarnessRunContext): Promise<HarnessRoundResult> {
+    if (context.run.providerId === "provider-a") {
+      throw new Error("429 too many requests");
+    }
+    await writeFile(path.join(context.workspacePath, "index.html"), "healthy", "utf8");
+    return { response: "healthy" };
+  }
+  async abortRun(): Promise<void> {}
+  async releaseRun(): Promise<void> {}
+}
+
+class QuotaFailureHarness implements GenerationHarness {
+  async start(): Promise<void> {}
+  async stop(): Promise<void> {}
+  async beginRun(context: HarnessRunContext): Promise<string> {
+    return `quota-session-${context.run.id}`;
+  }
+  async executeRound(): Promise<HarnessRoundResult> {
+    throw new Error(
+      'APIError: Forbidden: {"error":{"message":"用户额度不足, 剩余额度: $-3.66","code":"insufficient_user_quota"}}',
+    );
+  }
+  async abortRun(): Promise<void> {}
+  async releaseRun(): Promise<void> {}
+}
+
+class UnknownFinishOnceHarness implements GenerationHarness {
+  private readonly calls = new Map<string, number>();
+
+  async start(): Promise<void> {}
+  async stop(): Promise<void> {}
+  async beginRun(context: HarnessRunContext): Promise<string> {
+    return `unknown-finish-session-${context.run.id}`;
+  }
+  async executeRound(context: HarnessRunContext): Promise<HarnessRoundResult> {
+    const calls = (this.calls.get(context.run.id) ?? 0) + 1;
+    this.calls.set(context.run.id, calls);
+    if (calls === 1) {
+      throw new Error("OpenCode 上游响应连续异常结束：finish=unknown，已在原会话续作 3 次");
+    }
+    await writeFile(path.join(context.workspacePath, "index.html"), "continued", "utf8");
+    return { response: "continued successfully" };
+  }
+  async abortRun(): Promise<void> {}
+  async releaseRun(): Promise<void> {}
+}
+
+class RoundTimeoutHarness implements GenerationHarness {
+  async start(): Promise<void> {}
+  async stop(): Promise<void> {}
+  async beginRun(context: HarnessRunContext): Promise<string> {
+    return `timeout-session-${context.run.id}`;
+  }
+  async executeRound(context: HarnessRunContext): Promise<HarnessRoundResult> {
+    await new Promise<void>((resolve, reject) => {
+      if (context.signal.aborted) {
+        reject(context.signal.reason);
+        return;
+      }
+      context.signal.addEventListener("abort", () => reject(context.signal.reason), { once: true });
+    });
+    return { response: "unexpected completion" };
   }
   async abortRun(): Promise<void> {}
   async releaseRun(): Promise<void> {}
