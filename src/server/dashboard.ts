@@ -453,6 +453,7 @@ function publicExperiment(experiment: ExperimentRecord) {
         model: model.model,
         enabled: model.enabled,
         concurrency: model.concurrency,
+        ...(model.roundTimeoutMs !== undefined ? { roundTimeoutMs: model.roundTimeoutMs } : {}),
         ...(model.reasoningEffort ? { reasoningEffort: model.reasoningEffort } : {}),
       })),
     },

@@ -47,6 +47,8 @@ export interface ModelConfig {
   modelName: string;
   enabled: boolean;
   concurrency: number;
+  /** Per-model hard round timeout override. Zero disables the hard timeout. */
+  roundTimeoutMs?: number;
   reasoningEffort?: string;
   agent?: string;
   systemPrompt?: string;

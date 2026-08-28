@@ -450,6 +450,70 @@ describe("generation orchestrator", () => {
     }
   });
 
+  it("reopens provider dispatch after the probe produces its first model step", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "gamebench-provider-probe-progress-"));
+    temporaryDirectories.push(directory);
+    const loaded = await loadBenchmarkConfig(path.resolve("examples/benchmark.mock.json"));
+    const baseTask = loaded.tasks[0]!;
+    const tasks = Array.from({ length: 3 }, (_, index) => ({
+      ...baseTask,
+      id: `provider-probe-task-${index + 1}`,
+      title: `Provider probe task ${index + 1}`,
+    }));
+    loaded.config.models = [model("probe-model", "provider-a", 3)];
+    loaded.config.runtime.globalConcurrency = 3;
+    loaded.config.runtime.providerConcurrency = { "provider-a": 3 };
+    loaded.config.runtime.outputDir = path.join(directory, "runs");
+    loaded.config.runtime.dataDir = path.join(directory, "data");
+    const db = new BenchmarkDatabase(path.join(directory, "benchmark.sqlite"));
+    const experiment = db.createExperiment(loaded.config, tasks);
+    db.updateExperimentStatus(experiment.id, "paused");
+    const pausedExperiment = db.getExperiment(experiment.id)!;
+    const harness = new ProviderProbeProgressHarness();
+    const orchestrator = new GenerationOrchestrator(
+      db,
+      pausedExperiment,
+      loaded.config,
+      tasks,
+      harness,
+    );
+    try {
+      await orchestrator.start();
+      const internals = orchestrator as unknown as {
+        providerCircuits: Map<string, {
+          scope: "provider";
+          failureCount: number;
+          blockedUntil: number;
+          probeInFlight: boolean;
+          error: string;
+        }>;
+      };
+      internals.providerCircuits.set("provider-a", {
+        scope: "provider",
+        failureCount: 1,
+        blockedUntil: Date.now() - 1,
+        probeInFlight: false,
+        error: "temporary provider outage",
+      });
+
+      orchestrator.resume();
+      await waitFor(() => harness.beginCalls === 3 && harness.maximumActive === 3, 4_000);
+      expect(db.listEvents({ experimentId: experiment.id }).some((event) =>
+        event.type === "experiment.dispatch.recovered" &&
+        event.data.scope === "provider" &&
+        event.data.providerId === "provider-a"
+      )).toBe(true);
+
+      harness.releaseAll();
+      await orchestrator.waitForCompletion();
+      expect(db.getSummary(experiment.id).completed).toBe(3);
+    } finally {
+      harness.releaseAll();
+      await orchestrator.shutdown();
+      db.close();
+    }
+  });
+
   it("pauses immediately on exhausted provider quota without burning attempt budgets", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "gamebench-provider-quota-"));
     temporaryDirectories.push(directory);
@@ -552,6 +616,55 @@ describe("generation orchestrator", () => {
     loaded.config.models = loaded.config.models.slice(0, 1);
     loaded.tasks = loaded.tasks.slice(0, 1);
     loaded.config.runtime.globalConcurrency = 1;
+    loaded.config.runtime.maxAttempts = 2;
+    loaded.config.runtime.roundTimeoutMs = 25;
+    loaded.config.runtime.outputDir = path.join(directory, "runs");
+    loaded.config.runtime.dataDir = path.join(directory, "data");
+    const db = new BenchmarkDatabase(path.join(directory, "benchmark.sqlite"));
+    const experiment = db.createExperiment(loaded.config, loaded.tasks);
+    const harness = new RoundTimeoutHarness();
+    const orchestrator = new GenerationOrchestrator(
+      db,
+      experiment,
+      loaded.config,
+      loaded.tasks,
+      harness,
+    );
+    try {
+      await orchestrator.start();
+      const completed = await orchestrator.waitForCompletion();
+      expect(completed.status).toBe("failed");
+      expect(db.getSummary(experiment.id)).toMatchObject({ failed: 1, retrying: 0 });
+      expect(harness.beginRunCount).toBe(1);
+      expect(harness.releasePreservation).toEqual([true, false]);
+      expect(db.listEvents({ experimentId: experiment.id }).some((event) =>
+        event.type === "run.retrying" && event.data.repairInPlace === true
+      )).toBe(true);
+      expect(db.listEvents({ experimentId: experiment.id }).some((event) =>
+        event.type === "run.failed" && event.data.error === "轮次执行超过硬超时 25ms"
+      )).toBe(true);
+      expect(db.listEvents({ experimentId: experiment.id }).some((event) =>
+        event.type === "run.infrastructure.retrying"
+      )).toBe(false);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("allows a model-level unlimited timeout to override task and runtime limits", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "gamebench-model-unlimited-"));
+    temporaryDirectories.push(directory);
+    const loaded = await loadBenchmarkConfig(path.resolve("examples/benchmark.mock.json"));
+    loaded.config.models = loaded.config.models.slice(0, 1).map((item) => ({
+      ...item,
+      roundTimeoutMs: 0,
+    }));
+    loaded.tasks = loaded.tasks.slice(0, 1);
+    loaded.tasks[0]!.rounds = loaded.tasks[0]!.rounds.slice(0, 1).map((round) => ({
+      ...round,
+      timeoutMs: 25,
+    }));
+    loaded.config.runtime.globalConcurrency = 1;
     loaded.config.runtime.maxAttempts = 1;
     loaded.config.runtime.roundTimeoutMs = 25;
     loaded.config.runtime.outputDir = path.join(directory, "runs");
@@ -563,19 +676,18 @@ describe("generation orchestrator", () => {
       experiment,
       loaded.config,
       loaded.tasks,
-      new RoundTimeoutHarness(),
+      new DelayedSuccessHarness(),
     );
     try {
       await orchestrator.start();
-      const completed = await orchestrator.waitForCompletion();
-      expect(completed.status).toBe("failed");
-      expect(db.getSummary(experiment.id)).toMatchObject({ failed: 1, retrying: 0 });
-      expect(db.listEvents({ experimentId: experiment.id }).some((event) =>
-        event.type === "run.failed" && event.data.error === "轮次执行超过硬超时 25ms"
-      )).toBe(true);
-      expect(db.listEvents({ experimentId: experiment.id }).some((event) =>
-        event.type === "run.infrastructure.retrying"
-      )).toBe(false);
+      expect((await orchestrator.waitForCompletion()).status).toBe("completed");
+      expect(db.getSummary(experiment.id)).toMatchObject({ completed: 1, failed: 0 });
+      expect(db.listEvents({ experimentId: experiment.id })).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          type: "round.started",
+          data: expect.objectContaining({ timeoutMs: null, unlimited: true }),
+        }),
+      ]));
     } finally {
       db.close();
     }
@@ -768,6 +880,40 @@ class ProviderIsolationHarness implements GenerationHarness {
   async releaseRun(): Promise<void> {}
 }
 
+class ProviderProbeProgressHarness implements GenerationHarness {
+  beginCalls = 0;
+  maximumActive = 0;
+  private active = 0;
+  private release!: () => void;
+  private readonly gate = new Promise<void>((resolve) => {
+    this.release = resolve;
+  });
+
+  async start(): Promise<void> {}
+  async stop(): Promise<void> {}
+  async beginRun(context: HarnessRunContext): Promise<string> {
+    this.beginCalls += 1;
+    return `provider-probe-session-${context.run.id}`;
+  }
+  async executeRound(context: HarnessRunContext): Promise<HarnessRoundResult> {
+    this.active += 1;
+    this.maximumActive = Math.max(this.maximumActive, this.active);
+    context.emit("harness.step.completed", "info", "probe received a model step");
+    try {
+      await this.gate;
+      await writeFile(path.join(context.workspacePath, "index.html"), "probe complete", "utf8");
+      return { response: "probe complete" };
+    } finally {
+      this.active -= 1;
+    }
+  }
+  async abortRun(): Promise<void> {}
+  async releaseRun(): Promise<void> {}
+  releaseAll(): void {
+    this.release();
+  }
+}
+
 class QuotaFailureHarness implements GenerationHarness {
   async start(): Promise<void> {}
   async stop(): Promise<void> {}
@@ -805,9 +951,12 @@ class UnknownFinishOnceHarness implements GenerationHarness {
 }
 
 class RoundTimeoutHarness implements GenerationHarness {
+  beginRunCount = 0;
+  releasePreservation: boolean[] = [];
   async start(): Promise<void> {}
   async stop(): Promise<void> {}
   async beginRun(context: HarnessRunContext): Promise<string> {
+    this.beginRunCount += 1;
     return `timeout-session-${context.run.id}`;
   }
   async executeRound(context: HarnessRunContext): Promise<HarnessRoundResult> {
@@ -819,6 +968,32 @@ class RoundTimeoutHarness implements GenerationHarness {
       context.signal.addEventListener("abort", () => reject(context.signal.reason), { once: true });
     });
     return { response: "unexpected completion" };
+  }
+  async abortRun(): Promise<void> {}
+  async releaseRun(
+    _sessionId: string | null,
+    _workspacePath: string,
+    options: { preserveSession?: boolean } = {},
+  ): Promise<void> {
+    this.releasePreservation.push(options.preserveSession === true);
+  }
+}
+
+class DelayedSuccessHarness implements GenerationHarness {
+  async start(): Promise<void> {}
+  async stop(): Promise<void> {}
+  async beginRun(context: HarnessRunContext): Promise<string> {
+    return `delayed-session-${context.run.id}`;
+  }
+  async executeRound(context: HarnessRunContext): Promise<HarnessRoundResult> {
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(resolve, 50);
+      context.signal.addEventListener("abort", () => {
+        clearTimeout(timer);
+        reject(context.signal.reason);
+      }, { once: true });
+    });
+    return { response: "completed after the inherited limits" };
   }
   async abortRun(): Promise<void> {}
   async releaseRun(): Promise<void> {}

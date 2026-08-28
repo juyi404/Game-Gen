@@ -56,12 +56,13 @@ describe("benchmark config", () => {
         version: 1,
         name: "Unlimited generation",
         dataset: { dir: "./tasks" },
-        models: [{ id: "model", model: "provider/model" }],
+        models: [{ id: "model", model: "provider/model", roundTimeoutMs: 0 }],
         runtime: { harness: "mock", roundTimeoutMs: 1_800_000 },
       }));
 
       const { config, tasks } = await loadBenchmarkConfig(configPath);
       expect(config.runtime.roundTimeoutMs).toBe(1_800_000);
+      expect(config.models[0]?.roundTimeoutMs).toBe(0);
       expect(config.runtime.roundIdleTimeoutMs).toBe(30 * 60 * 1000);
       expect(tasks[0]?.rounds[0]?.timeoutMs).toBe(60_000);
     } finally {

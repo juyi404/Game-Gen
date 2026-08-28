@@ -190,9 +190,13 @@ export async function writeRoundContext(input: RoundContextWriteInput): Promise<
       number: input.roundRecord.roundIndex + 1,
       id: input.roundRecord.roundId,
       status: input.roundRecord.status,
-      timeoutMs: (input.round.timeoutMs ?? input.config.runtime.roundTimeoutMs) || null,
+      timeoutMs: (input.model.roundTimeoutMs
+        ?? input.round.timeoutMs
+        ?? input.config.runtime.roundTimeoutMs) || null,
       idleTimeoutMs: input.config.runtime.roundIdleTimeoutMs || null,
-      unlimited: (input.round.timeoutMs ?? input.config.runtime.roundTimeoutMs) <= 0,
+      unlimited: (input.model.roundTimeoutMs
+        ?? input.round.timeoutMs
+        ?? input.config.runtime.roundTimeoutMs) <= 0,
       startedAt: toIsoString(input.roundRecord.startedAt),
       completedAt: toIsoString(input.roundRecord.completedAt),
       error: input.roundRecord.error,

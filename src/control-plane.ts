@@ -50,6 +50,7 @@ const experimentModelSchema = z.object({
   model: z.string().regex(/^[^/]+\/.+$/, "模型必须使用 provider/model 格式"),
   enabled: z.boolean().default(true),
   concurrency: z.number().int().min(1).max(1_000),
+  roundTimeoutMs: z.number().int().min(0).max(24 * 60 * 60 * 1000).optional(),
   reasoningEffort: identifierSchema.optional(),
 });
 

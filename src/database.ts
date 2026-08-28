@@ -552,21 +552,30 @@ export class BenchmarkDatabase extends EventEmitter {
       throw new Error("只能重试失败或已取消的运行");
     }
     const now = Date.now();
-    this.db
-      .prepare(`
-        UPDATE runs SET status = 'queued', current_round = 0,
-          max_attempts = MAX(max_attempts, attempt + 1), available_at = ?,
-          session_id = NULL, error = NULL, completed_at = NULL, updated_at = ?,
-          resume_pending = 0, infra_attempts = 0, infra_first_failed_at = NULL
-        WHERE id = ?
-      `)
-      .run(now, now, id);
-    this.db
-      .prepare(`
-        UPDATE rounds SET status = 'pending', started_at = NULL, completed_at = NULL,
-          response = NULL, error = NULL, usage_json = NULL WHERE run_id = ?
-      `)
-      .run(id);
+    this.transaction(() => {
+      this.db
+        .prepare(`
+          UPDATE rounds SET status = 'pending', started_at = NULL, completed_at = NULL,
+            response = NULL, error = NULL, usage_json = NULL
+          WHERE run_id = ? AND status != 'completed'
+        `)
+        .run(id);
+      this.db
+        .prepare(`
+          UPDATE runs SET status = 'queued',
+            current_round = (
+              SELECT COUNT(*) FROM rounds
+              WHERE rounds.run_id = runs.id AND rounds.status = 'completed'
+            ),
+            attempt = CASE WHEN workspace_path IS NOT NULL THEN attempt + 1 ELSE attempt END,
+            max_attempts = MAX(max_attempts, attempt + 1), available_at = ?,
+            session_id = NULL, error = NULL, completed_at = NULL, updated_at = ?,
+            resume_pending = CASE WHEN workspace_path IS NOT NULL THEN 1 ELSE 0 END,
+            infra_attempts = 0, infra_first_failed_at = NULL
+          WHERE id = ?
+        `)
+        .run(now, now, id);
+    });
   }
 
   getRounds(runId: string): RoundRecord[] {

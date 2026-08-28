@@ -200,6 +200,55 @@ describe("benchmark database", () => {
     }
   });
 
+  it("manually retries a failed run in its existing workspace without replaying completed rounds", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "gamebench-db-manual-resume-"));
+    temporaryDirectories.push(directory);
+    const loaded = await loadBenchmarkConfig(path.resolve("examples/benchmark.mock.json"));
+    loaded.config.models = loaded.config.models.slice(0, 1);
+    const db = new BenchmarkDatabase(path.join(directory, "benchmark.sqlite"));
+    try {
+      const experiment = db.createExperiment(loaded.config, loaded.tasks.slice(0, 1));
+      const run = db.listRuns(experiment.id)[0]!;
+      db.claimRun(run.id);
+      const workspacePath = path.join(directory, "partial-game");
+      db.updateRun(run.id, {
+        status: "failed",
+        currentRound: 2,
+        workspacePath,
+        sessionId: "released-session",
+      });
+      db.updateRound(run.id, 0, "completed", { response: "keep me" });
+      db.updateRound(run.id, 1, "failed", { error: "missing asset" });
+
+      db.resetFailedRun(run.id);
+
+      expect(db.getRun(run.id)).toMatchObject({
+        status: "queued",
+        currentRound: 1,
+        attempt: 2,
+        workspacePath,
+        sessionId: null,
+        resumePending: true,
+      });
+      expect(db.getRounds(run.id)[0]).toMatchObject({
+        status: "completed",
+        response: "keep me",
+      });
+      expect(db.getRounds(run.id)[1]).toMatchObject({
+        status: "pending",
+        response: null,
+        error: null,
+      });
+      expect(db.claimRun(run.id)).toMatchObject({
+        attempt: 2,
+        workspacePath,
+        resumePending: true,
+      });
+    } finally {
+      db.close();
+    }
+  });
+
   it("dispatches preserved workspace resumes before untouched queued runs", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "gamebench-db-resume-priority-"));
     temporaryDirectories.push(directory);

@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-import { existsSync } from "node:fs";
 import path from "node:path";
 import { loadBenchmarkConfig } from "./config.js";
 import { ControlPlane, type ControlPlaneOptions } from "./control-plane.js";
@@ -116,7 +115,6 @@ function createControlPlaneOptions(
   cli: CliOptions,
 ): ControlPlaneOptions {
   const projectRoot = process.cwd();
-  const defaultTemplate = path.join(projectRoot, "examples", "template");
   const dashboard = {
     hostname: cli.hostname ?? config?.dashboard.hostname ?? "127.0.0.1",
     port: cli.port ?? config?.dashboard.port ?? 8787,
@@ -135,8 +133,12 @@ function createControlPlaneOptions(
     opencode,
     dashboard,
   };
-  const workspaceTemplate = config?.runtime.workspaceTemplate ??
-    (existsSync(defaultTemplate) ? defaultTemplate : undefined);
+  // A workspace template changes the model's starting point and therefore must
+  // be explicitly opted into by benchmark configuration.  In particular, the
+  // dashboard/serve path must not silently seed generated games with example
+  // source files, otherwise different experiments no longer measure a clean
+  // model + OpenCode baseline.
+  const workspaceTemplate = config?.runtime.workspaceTemplate;
   if (workspaceTemplate) options.workspaceTemplate = workspaceTemplate;
   return options;
 }

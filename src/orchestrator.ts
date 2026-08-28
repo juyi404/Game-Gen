@@ -349,6 +349,9 @@ export class GenerationOrchestrator extends EventEmitter {
 
     const emit: HarnessRunContext["emit"] = (type, level, message, data = {}) => {
       this.db.appendEvent(this.experiment.id, run.id, type, level, message, data);
+      if (type === "harness.step.completed") {
+        this.acknowledgeInfrastructureProbe(active, "provider", run.id, run.providerId);
+      }
     };
 
     try {
@@ -381,9 +384,7 @@ export class GenerationOrchestrator extends EventEmitter {
       const sessionId = run.sessionId ?? await this.harness.beginRun(baseContext);
       active.sessionId = sessionId;
       this.db.updateRun(run.id, { sessionId });
-      if (this.isCircuitProbe(active, "opencode")) {
-        this.closeInfrastructureCircuit("opencode", run.id, run.providerId);
-      }
+      this.acknowledgeInfrastructureProbe(active, "opencode", run.id, run.providerId);
       if (run.sessionId) {
         this.emitRunEvent(run.id, "harness.session.resumed", "info", "继续使用上一阶段的 OpenCode 会话", {
           sessionId,
@@ -399,7 +400,9 @@ export class GenerationOrchestrator extends EventEmitter {
       for (let roundIndex = startRound; roundIndex < targetRound; roundIndex += 1) {
         const round = task.rounds[roundIndex]!;
         if (active.controller.signal.aborted) throw active.controller.signal.reason;
-        const timeoutMs = round.timeoutMs ?? this.config.runtime.roundTimeoutMs;
+        const timeoutMs = model.roundTimeoutMs
+          ?? round.timeoutMs
+          ?? this.config.runtime.roundTimeoutMs;
         const deadline = createDeadline(active.controller.signal, timeoutMs);
         this.db.updateRound(run.id, roundIndex, "running");
         this.db.updateRun(run.id, { currentRound: roundIndex + 1 });
@@ -432,9 +435,7 @@ export class GenerationOrchestrator extends EventEmitter {
             round,
             roundIndex,
           );
-          if (this.isCircuitProbe(active, "provider", run.providerId)) {
-            this.closeInfrastructureCircuit("provider", run.id, run.providerId);
-          }
+          this.acknowledgeInfrastructureProbe(active, "provider", run.id, run.providerId);
           this.db.clearInfrastructureFailures(run.id);
           this.db.updateRound(run.id, roundIndex, "completed", {
             response: result.response,
@@ -666,21 +667,21 @@ export class GenerationOrchestrator extends EventEmitter {
         await this.releaseHarnessRun(run.id, active, true);
         return;
       }
-      if (this.isCircuitProbe(active, "provider", run.providerId)) {
-        this.closeInfrastructureCircuit("provider", run.id, run.providerId);
-      }
+      this.acknowledgeInfrastructureProbe(active, "provider", run.id, run.providerId);
       this.db.clearInfrastructureFailures(run.id);
       if (run.attempt < run.maxAttempts) {
         const delayMs = this.config.runtime.retryBackoffMs * 2 ** Math.max(run.attempt - 1, 0);
-        const repairInPlace = isRepairableArtifactFailure(message);
+        const repairInPlace = isRepairableArtifactFailure(message) || isHardRoundTimeout(message);
         this.db.retryRun(run.id, delayMs, message, { preserveSession: repairInPlace });
         await this.writeAttemptResultSafely(run.id, active.workspacePath, "failed", message, true);
         this.emitRunEvent(
           run.id,
           "run.retrying",
           "warn",
-          repairInPlace
-            ? "产物验收失败，已保留工作区与 Session 等待原地修复"
+          isHardRoundTimeout(message)
+            ? "轮次达到硬超时，已保留工作区与 Session 等待原会话续跑"
+            : repairInPlace
+              ? "产物验收失败，已保留工作区与 Session 等待原地修复"
             : "运行失败，等待自动重试",
           {
             error: message,
@@ -776,6 +777,21 @@ export class GenerationOrchestrator extends EventEmitter {
       },
     );
     void this.pump();
+  }
+
+  private acknowledgeInfrastructureProbe(
+    active: ActiveRun,
+    scope: InfrastructureScope,
+    runId: string,
+    providerId: string,
+  ): void {
+    const probeIndex = active.circuitProbes.findIndex(
+      (probe) => probe.scope === scope &&
+        (scope !== "provider" || probe.providerId === providerId),
+    );
+    if (probeIndex === -1) return;
+    active.circuitProbes.splice(probeIndex, 1);
+    this.closeInfrastructureCircuit(scope, runId, providerId);
   }
 
   private isCircuitProbe(
@@ -1039,6 +1055,10 @@ export class GenerationOrchestrator extends EventEmitter {
 
 function isRepairableArtifactFailure(message: string): boolean {
   return message.trimStart().startsWith("生成结果无效：");
+}
+
+function isHardRoundTimeout(message: string): boolean {
+  return message.trimStart().startsWith("轮次执行超过硬超时 ");
 }
 
 function createDeadline(parent: AbortSignal, timeoutMs: number): {

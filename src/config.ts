@@ -87,6 +87,7 @@ const rawModelSchema = z.object({
   model: z.string().regex(/^[^/]+\/.+$/, "model 必须使用 provider/model 格式"),
   enabled: z.boolean().default(true),
   concurrency: z.number().int().positive().default(1),
+  roundTimeoutMs: z.number().int().min(0).max(MAX_ROUND_TIMEOUT_MS).optional(),
   reasoningEffort: identifierSchema.optional(),
   agent: z.string().min(1).optional(),
   systemPrompt: z.string().optional(),
@@ -189,6 +190,7 @@ export async function loadBenchmarkConfig(configPath: string): Promise<{
       enabled: model.enabled,
       concurrency: model.concurrency,
     };
+    if (model.roundTimeoutMs !== undefined) result.roundTimeoutMs = model.roundTimeoutMs;
     if (model.reasoningEffort) result.reasoningEffort = model.reasoningEffort;
     if (model.agent) result.agent = model.agent;
     if (model.systemPrompt) result.systemPrompt = model.systemPrompt;

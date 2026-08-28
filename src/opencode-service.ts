@@ -40,7 +40,8 @@ const OPENCODE_VERIFICATION_TTL_MS = 6 * 60 * 60 * 1000;
 const MAX_DISCOVERED_AGGREGATOR_MODELS = 50;
 const AGGREGATOR_PROBE_TIMEOUT_MS = 15_000;
 const AGGREGATOR_MAX_RESPONSE_BYTES = 1024 * 1024;
-const MODEL_PROBE_TIMEOUT_MS = 45_000;
+const MODEL_PROBE_TIMEOUT_MS = 120_000;
+const MODEL_PROBE_FILE_SETTLE_MS = 5_000;
 const PACKY_ENDPOINTS = [
   "openai",
   "openai-response",
@@ -622,7 +623,10 @@ export class OpenCodeService {
       }
     }
 
-    const probed = await mapWithConcurrency(pending, 4, async ({ index, request }) => ({
+    // Capability probes create real OpenCode sessions and write to the shared
+    // OpenCode database. Keeping this lower than generation concurrency avoids
+    // probe-only database contention while providers are being configured.
+    const probed = await mapWithConcurrency(pending, 2, async ({ index, request }) => ({
       index,
       result: await this.probeModelThroughOpenCode(request),
     }));
@@ -950,7 +954,6 @@ export class OpenCodeService {
           agent: this.config.agent,
           system: "This is a model capability probe. Use the write tool exactly once as instructed. Do not inspect other files or perform any other action.",
           ...(request.reasoningEffort ? { variant: request.reasoningEffort } : {}),
-          tools: { write: true, edit: false, bash: false, read: false, glob: false, grep: false, webfetch: false },
           parts: [{
             type: "text",
             text: `Use the write tool to create ${markerName} in the current directory with exactly this content: ${marker}`,
@@ -959,8 +962,7 @@ export class OpenCodeService {
         signal: AbortSignal.timeout(MODEL_PROBE_TIMEOUT_MS),
         throwOnError: true,
       });
-      const content = await readFile(markerPath, "utf8");
-      if (content.trim() !== marker) throw new Error("模型响应完成，但没有正确执行写文件工具");
+      await waitForProbeMarker(markerPath, marker, MODEL_PROBE_FILE_SETTLE_MS);
       const verifiedAt = Date.now();
       const record = {
         providerId: request.providerId,
@@ -981,6 +983,15 @@ export class OpenCodeService {
     } finally {
       const client = this.client;
       if (client && sessionId) {
+        // A timed-out prompt may still be finishing its tool call in OpenCode.
+        // Abort it before deleting the session so late message writes cannot
+        // race the session cascade and trigger SQLite foreign-key failures.
+        await client.session.abort({
+          path: { id: sessionId },
+          query: { directory: workspace },
+          signal: AbortSignal.timeout(10_000),
+        }).catch(() => undefined);
+        await delay(250);
         await client.session.delete({
           path: { id: sessionId },
           query: { directory: workspace },
@@ -1732,6 +1743,26 @@ function modelProbeError(error: unknown): string {
   if (error.name === "TimeoutError") return "OpenCode 端到端工具调用验证超时";
   const message = error.message.replace(/\s+/g, " ").trim();
   return message || "OpenCode 端到端工具调用验证失败";
+}
+
+async function waitForProbeMarker(
+  markerPath: string,
+  expected: string,
+  timeoutMs: number,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  let observed: string | null = null;
+  do {
+    try {
+      observed = await readFile(markerPath, "utf8");
+      if (observed.trim() === expected) return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    await delay(100);
+  } while (Date.now() < deadline);
+  if (observed !== null) throw new Error("模型响应完成，但写文件内容不正确");
+  throw new Error("模型响应完成，但没有执行写文件工具");
 }
 
 function portFromUrl(value: string): number | null {
