@@ -67,6 +67,8 @@ const experimentInputSchema = z.object({
   providerConcurrency: z.record(z.string(), z.number().int().min(1).max(1_000)).default({}),
   maxAttempts: z.number().int().min(1).max(10).default(2),
   roundTimeoutMs: z.number().int().min(0).max(24 * 60 * 60 * 1000).default(0),
+  initialBuildSoftTimeoutMs: z.number().int().min(0).max(24 * 60 * 60 * 1000).optional(),
+  initialBuildWrapUpMs: z.number().int().min(1).max(60 * 60 * 1000).optional(),
   roundIdleTimeoutMs: z.number().int().min(0).max(24 * 60 * 60 * 1000)
     .default(30 * 60 * 1000),
   retryBackoffMs: z.number().int().min(0).max(60 * 60 * 1000).default(10_000),
@@ -594,6 +596,10 @@ export class ControlPlane {
         outputDir: this.options.outputDir,
         dataDir: this.options.dataDir,
         roundTimeoutMs: parsed.roundTimeoutMs,
+        ...(parsed.initialBuildSoftTimeoutMs !== undefined
+          ? { initialBuildSoftTimeoutMs: parsed.initialBuildSoftTimeoutMs } : {}),
+        ...(parsed.initialBuildWrapUpMs !== undefined
+          ? { initialBuildWrapUpMs: parsed.initialBuildWrapUpMs } : {}),
         roundIdleTimeoutMs: parsed.roundIdleTimeoutMs,
         maxAttempts: parsed.maxAttempts,
         retryBackoffMs: parsed.retryBackoffMs,

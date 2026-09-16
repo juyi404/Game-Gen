@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -19,6 +20,37 @@ afterEach(async () => {
 });
 
 describe("generation orchestrator", () => {
+  it("preserves a delivery failure without retrying after the initial build budget", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "gamebench-delivery-"));
+    temporaryDirectories.push(directory);
+    const loaded = await loadBenchmarkConfig(path.resolve("examples/benchmark.mock.json"));
+    loaded.config.models = loaded.config.models.slice(0, 1);
+    loaded.tasks = loaded.tasks.slice(0, 1);
+    loaded.config.runtime.outputDir = path.join(directory, "runs");
+    loaded.config.runtime.dataDir = path.join(directory, "data");
+    loaded.config.runtime.stageMode = "manual";
+    loaded.config.runtime.initialBuildSoftTimeoutMs = 1;
+    loaded.config.runtime.roundTimeoutMs = 20;
+    loaded.config.runtime.maxAttempts = 3;
+    const db = new BenchmarkDatabase(path.join(directory, "benchmark.sqlite"));
+    const experiment = db.createExperiment(loaded.config, loaded.tasks);
+    const harness = new RoundTimeoutHarness();
+    const orchestrator = new GenerationOrchestrator(db, experiment, loaded.config, loaded.tasks, harness);
+    try {
+      await orchestrator.start();
+      await orchestrator.waitForCompletion();
+      const run = db.listRuns(experiment.id)[0]!;
+      expect(run.status).toBe("failed");
+      expect(run.attempt).toBe(1);
+      expect(run.sessionId).toBeTruthy();
+      expect(harness.beginRunCount).toBe(1);
+      expect(harness.releasePreservation).toEqual([true]);
+    } finally {
+      await orchestrator.shutdown();
+      db.close();
+    }
+  });
+
   it("keeps rounds sequential while respecting global concurrency", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "gamebench-run-"));
     temporaryDirectories.push(directory);
@@ -294,7 +326,7 @@ describe("generation orchestrator", () => {
     }
   });
 
-  it("preserves a failed attempt when the next attempt succeeds", async () => {
+  it("resumes a failed attempt in the same workspace and session", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "gamebench-retry-artifacts-"));
     temporaryDirectories.push(directory);
     const loaded = await loadBenchmarkConfig(path.resolve("examples/benchmark.mock.json"));
@@ -320,36 +352,18 @@ describe("generation orchestrator", () => {
       expect(completed.status).toBe("completed");
       const run = db.listRuns(experiment.id)[0]!;
       expect(run.attempt).toBe(2);
-      const runRoot = path.dirname(run.workspacePath!);
-      const firstResult = JSON.parse(
-        await readFile(path.join(runRoot, "attempt-1", ".benchmark", "result.json"), "utf8"),
-      ) as { status: string; willRetry: boolean; rounds: Array<{ contextFile: string }> };
-      const secondResult = JSON.parse(
-        await readFile(path.join(runRoot, "attempt-2", ".benchmark", "result.json"), "utf8"),
-      ) as { status: string; willRetry: boolean; rounds: Array<{ contextFile: string }> };
-      expect(firstResult).toMatchObject({ status: "failed", willRetry: true });
-      expect(secondResult).toMatchObject({ status: "completed", willRetry: false });
-      const failedContext = JSON.parse(
-        await readFile(firstResult.rounds[0]!.contextFile, "utf8"),
-      ) as {
-        attempt: number;
-        round: { status: string; error: string };
-        currentTurn: { assistant: null };
-      };
-      expect(failedContext).toMatchObject({
-        attempt: 1,
-        round: { status: "failed", error: "retry this attempt" },
-        currentTurn: { assistant: null },
-      });
-      for (const round of secondResult.rounds) {
-        const context = JSON.parse(await readFile(round.contextFile, "utf8")) as {
-          attempt: number;
-          round: { status: string };
-        };
-        expect(context).toMatchObject({ attempt: 2, round: { status: "completed" } });
-      }
-      expect(await readFile(path.join(runRoot, "attempt-1", "partial.txt"), "utf8")).toBe("kept");
-      expect(await readFile(path.join(runRoot, "attempt-2", "index.html"), "utf8")).toContain("retry success");
+      expect(path.basename(run.workspacePath!)).toBe("attempt-1");
+      expect(run.sessionId).toBe("retry-session-1");
+      const result = JSON.parse(
+        await readFile(path.join(run.workspacePath!, ".benchmark", "result.json"), "utf8"),
+      ) as { status: string; willRetry: boolean };
+      expect(result).toMatchObject({ status: "completed", willRetry: false });
+      expect(await readFile(path.join(run.workspacePath!, "partial.txt"), "utf8")).toBe("kept");
+      expect(await readFile(path.join(run.workspacePath!, "index.html"), "utf8")).toContain("retry success");
+      expect(existsSync(path.join(path.dirname(run.workspacePath!), "attempt-2"))).toBe(false);
+      expect(db.listEvents({ experimentId: experiment.id }).some((event) =>
+        event.type === "run.retrying" && event.data.resumedInPlace === true
+      )).toBe(true);
     } finally {
       db.close();
     }
@@ -495,6 +509,7 @@ describe("generation orchestrator", () => {
         probeInFlight: false,
         error: "temporary provider outage",
       });
+      for (const run of db.listRuns(experiment.id)) db.recordInfrastructureFailure(run.id);
 
       orchestrator.resume();
       await waitFor(() => harness.beginCalls === 3 && harness.maximumActive === 3, 4_000);
@@ -503,6 +518,11 @@ describe("generation orchestrator", () => {
         event.data.scope === "provider" &&
         event.data.providerId === "provider-a"
       )).toBe(true);
+      const probeRunId = db.listEvents({ experimentId: experiment.id }).find((event) =>
+        event.type === "experiment.dispatch.probing" && event.data.providerId === "provider-a"
+      )?.data.runId;
+      expect(typeof probeRunId).toBe("string");
+      expect(db.getInfrastructureRetryState(String(probeRunId)).attempts).toBe(1);
 
       harness.releaseAll();
       await orchestrator.waitForCompletion();
@@ -568,7 +588,7 @@ describe("generation orchestrator", () => {
     }
   });
 
-  it("keeps filling concurrency when unknown finishes only require per-run continuation", async () => {
+  it("automatically resumes once after the harness exhausts its bounded continuation", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "gamebench-unknown-finish-refill-"));
     temporaryDirectories.push(directory);
     const loaded = await loadBenchmarkConfig(path.resolve("examples/benchmark.mock.json"));
@@ -598,15 +618,121 @@ describe("generation orchestrator", () => {
     );
     try {
       await orchestrator.start();
+      await waitFor(() => db.getSummary(experiment.id).retrying === 2 && orchestrator.activeCount === 0);
+      for (const run of db.listRuns(experiment.id)) db.updateRun(run.id, { availableAt: 0 });
+      await (orchestrator as unknown as { pump(): Promise<void> }).pump();
       expect((await orchestrator.waitForCompletion()).status).toBe("completed");
       expect(db.getSummary(experiment.id)).toMatchObject({ completed: 2, failed: 0, retrying: 0 });
       expect(db.listRuns(experiment.id).every((run) => run.attempt === 1)).toBe(true);
       const events = db.listEvents({ experimentId: experiment.id });
-      expect(events.filter((event) => event.type === "run.continuation.retrying")).toHaveLength(2);
+      expect(events.filter((event) =>
+        event.type === "run.continuation.retrying" && event.data.automaticRecovery === true
+      )).toHaveLength(2);
+      expect(events.filter((event) => event.type === "run.continuation.blocked")).toHaveLength(0);
       expect(events.some((event) => event.type === "experiment.dispatch.cooldown")).toBe(false);
     } finally {
       db.close();
     }
+  });
+
+  it.each(["unknown", "length"])("continues repeated %s finishes automatically with persistent backoff", async (finish) => {
+    const directory = await mkdtemp(path.join(tmpdir(), "gamebench-auto-backoff-"));
+    temporaryDirectories.push(directory);
+    const loaded = await loadBenchmarkConfig(path.resolve("examples/benchmark.mock.json"));
+    loaded.config.models = loaded.config.models.slice(0, 1);
+    loaded.config.runtime.globalConcurrency = 1;
+    loaded.config.runtime.initialBuildSoftTimeoutMs = 3 * 60 * 60_000;
+    loaded.config.runtime.outputDir = path.join(directory, "runs");
+    const tasks = [{ ...loaded.tasks[0]!, rounds: loaded.tasks[0]!.rounds.slice(0, 1) }];
+    const db = new BenchmarkDatabase(path.join(directory, "benchmark.sqlite"));
+    const experiment = db.createExperiment(loaded.config, tasks);
+    let calls = 0;
+    const sessions: string[] = [];
+    const harness = new RetryOnceHarness();
+    harness.executeRound = async (context, sessionId) => {
+      calls += 1; sessions.push(sessionId);
+      await writeFile(path.join(context.workspacePath, "partial.txt"), "kept");
+      context.emit("harness.step.completed", "info", "cutoff", { reason: finish });
+      if (calls <= 3) throw new Error(`OpenCode 上游响应连续断尾：finish=${finish}，已在原会话续作 0 次`);
+      await writeFile(path.join(context.workspacePath, "index.html"), "continued");
+      return { response: "completed" };
+    };
+    const orchestrator = new GenerationOrchestrator(db, experiment, loaded.config, tasks, harness);
+    try {
+      await orchestrator.start();
+      for (let count = 1; count <= 3; count += 1) {
+        await waitFor(() => calls === count && orchestrator.activeCount === 0);
+        const run = db.listRuns(experiment.id)[0]!;
+        expect(run.status).toBe("retrying");
+        expect(db.getInfrastructureRetryState(run.id).attempts).toBe(count);
+        expect(run.availableAt - run.updatedAt).toBe(60_000 * 2 ** (count - 1));
+        expect(run.attempt).toBe(1);
+        db.updateRun(run.id, { availableAt: 0 });
+        await (orchestrator as unknown as { pump(): Promise<void> }).pump();
+      }
+      await orchestrator.waitForCompletion();
+      const run = db.listRuns(experiment.id)[0]!;
+      expect(run.status).toBe("completed");
+      expect(new Set(sessions).size).toBe(1);
+      expect(path.basename(run.workspacePath!)).toBe("attempt-1");
+      expect(calls).toBe(4);
+    } finally { await orchestrator.shutdown(); db.close(); }
+  });
+
+  it("keeps failed transport checks unpaid and automatically resumes the preserved run when healthy", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "gamebench-unpaid-recovery-"));
+    temporaryDirectories.push(directory);
+    const loaded = await loadBenchmarkConfig(path.resolve("examples/benchmark.mock.json"));
+    loaded.config.models = [model("recover-model", "provider-a", 1)];
+    loaded.config.runtime.globalConcurrency = 1;
+    loaded.config.runtime.initialBuildSoftTimeoutMs = 3 * 60 * 60_000;
+    loaded.config.runtime.outputDir = path.join(directory, "runs");
+    const tasks = [{ ...loaded.tasks[0]!, rounds: loaded.tasks[0]!.rounds.slice(0, 1) }];
+    const db = new BenchmarkDatabase(path.join(directory, "benchmark.sqlite"));
+    const experiment = db.createExperiment(loaded.config, tasks);
+    let paidCalls = 0;
+    let transportChecks = 0;
+    let healthy = false;
+    const sessions: string[] = [];
+    const harness: GenerationHarness = {
+      async start() {}, async stop() {}, async abortRun() {},
+      async beginRun() { return "preserved-session"; },
+      async checkInfrastructure() {
+        transportChecks += 1;
+        if (!healthy) throw new Error("TLS failed");
+      },
+      async executeRound(context, sessionId) {
+        paidCalls += 1; sessions.push(sessionId);
+        if (paidCalls === 1) throw new Error("unknown certificate verification error");
+        await writeFile(path.join(context.workspacePath, "index.html"), "recovered");
+        return { response: "recovered" };
+      },
+    };
+    const orchestrator = new GenerationOrchestrator(db, experiment, loaded.config, tasks, harness);
+    const internals = orchestrator as unknown as {
+      pump(): Promise<void>; providerCircuits: Map<string, { blockedUntil: number }>;
+    };
+    try {
+      await orchestrator.start();
+      await waitFor(() => paidCalls === 1 && orchestrator.activeCount === 0);
+      const firstRun = db.listRuns(experiment.id)[0]!;
+      for (let checks = 1; checks <= 3; checks += 1) {
+        db.updateRun(firstRun.id, { availableAt: 0 });
+        internals.providerCircuits.get("provider-a")!.blockedUntil = 0;
+        await internals.pump();
+        expect(transportChecks).toBe(checks);
+        expect(paidCalls).toBe(1);
+        expect(db.getRun(firstRun.id)).toMatchObject({ status: "retrying", sessionId: firstRun.sessionId, workspacePath: firstRun.workspacePath });
+      }
+      healthy = true;
+      db.updateRun(firstRun.id, { availableAt: 0 });
+      internals.providerCircuits.get("provider-a")!.blockedUntil = 0;
+      await internals.pump();
+      await orchestrator.waitForCompletion();
+      expect(paidCalls).toBe(2);
+      expect(new Set(sessions).size).toBe(1);
+      expect(db.getRun(firstRun.id)).toMatchObject({ status: "completed", attempt: 1, workspacePath: firstRun.workspacePath });
+    } finally { await orchestrator.shutdown(); db.close(); }
   });
 
   it("enforces the configured round hard timeout as a normal finite failure", async () => {
@@ -636,7 +762,7 @@ describe("generation orchestrator", () => {
       expect(completed.status).toBe("failed");
       expect(db.getSummary(experiment.id)).toMatchObject({ failed: 1, retrying: 0 });
       expect(harness.beginRunCount).toBe(1);
-      expect(harness.releasePreservation).toEqual([true, false]);
+      expect(harness.releasePreservation).toEqual([true, true]);
       expect(db.listEvents({ experimentId: experiment.id }).some((event) =>
         event.type === "run.retrying" && event.data.repairInPlace === true
       )).toBe(true);
@@ -941,7 +1067,7 @@ class UnknownFinishOnceHarness implements GenerationHarness {
     const calls = (this.calls.get(context.run.id) ?? 0) + 1;
     this.calls.set(context.run.id, calls);
     if (calls === 1) {
-      throw new Error("OpenCode 上游响应连续异常结束：finish=unknown，已在原会话续作 3 次");
+      throw new Error("OpenCode 上游响应连续断尾：finish=unknown，已在原会话续作 1 次");
     }
     await writeFile(path.join(context.workspacePath, "index.html"), "continued", "utf8");
     return { response: "continued successfully" };

@@ -111,6 +111,8 @@ const rawBenchmarkSchema = z.object({
       outputDir: z.string().min(1).default("./runs"),
       dataDir: z.string().min(1).default("./.gamebench"),
       roundTimeoutMs: z.number().int().min(0).max(MAX_ROUND_TIMEOUT_MS).default(0),
+      initialBuildSoftTimeoutMs: z.number().int().min(0).max(MAX_ROUND_TIMEOUT_MS).optional(),
+      initialBuildWrapUpMs: z.number().int().min(1).max(60 * 60 * 1000).optional(),
       roundIdleTimeoutMs: z.number().int().min(0).max(MAX_ROUND_TIMEOUT_MS)
         .default(DEFAULT_ROUND_IDLE_TIMEOUT_MS),
       maxAttempts: z.number().int().min(1).max(10).default(2),
@@ -216,6 +218,10 @@ export async function loadBenchmarkConfig(configPath: string): Promise<{
     outputDir: resolveFrom(configDir, raw.runtime.outputDir),
     dataDir: resolveFrom(configDir, raw.runtime.dataDir),
     roundTimeoutMs: raw.runtime.roundTimeoutMs,
+    ...(raw.runtime.initialBuildSoftTimeoutMs !== undefined
+      ? { initialBuildSoftTimeoutMs: raw.runtime.initialBuildSoftTimeoutMs } : {}),
+    ...(raw.runtime.initialBuildWrapUpMs !== undefined
+      ? { initialBuildWrapUpMs: raw.runtime.initialBuildWrapUpMs } : {}),
     roundIdleTimeoutMs: raw.runtime.roundIdleTimeoutMs,
     maxAttempts: raw.runtime.maxAttempts,
     retryBackoffMs: raw.runtime.retryBackoffMs,

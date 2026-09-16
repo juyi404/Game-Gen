@@ -49,7 +49,9 @@ export async function validateGeneratedGameArtifacts(workspacePath: string): Pro
 
 export function localEntryReferences(html: string): string[] {
   const references = new Set<string>();
-  for (const match of html.matchAll(/<(script|link|img|source|audio|video|track|iframe|input)\b[^>]*>/giu)) {
+  for (const match of html.matchAll(
+    /<(script|link|img|source|audio|video|track|iframe|input)\b(?:"[^"]*"|'[^']*'|[^'">])*>/giu,
+  )) {
     const tagName = match[1]!.toLowerCase();
     const tag = match[0];
     if (tagName === "script") {

@@ -200,6 +200,35 @@ describe("benchmark database", () => {
     }
   });
 
+  it("resumes an ordinary retry in place while consuming the attempt budget", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "gamebench-db-in-place-retry-"));
+    temporaryDirectories.push(directory);
+    const loaded = await loadBenchmarkConfig(path.resolve("examples/benchmark.mock.json"));
+    loaded.config.models = loaded.config.models.slice(0, 1);
+    const db = new BenchmarkDatabase(path.join(directory, "benchmark.sqlite"));
+    try {
+      const experiment = db.createExperiment(loaded.config, loaded.tasks.slice(0, 1));
+      const run = db.listRuns(experiment.id)[0]!;
+      db.claimRun(run.id);
+      const workspacePath = path.join(directory, "partial-game");
+      db.updateRun(run.id, { status: "running", currentRound: 1, workspacePath, sessionId: "same-session" });
+      db.updateRound(run.id, 0, "failed", { error: "temporary model error" });
+
+      db.retryRun(run.id, 0, "temporary model error", {
+        preserveProgress: true, preserveSession: true, incrementAttempt: true,
+      });
+      expect(db.getRun(run.id)).toMatchObject({
+        status: "retrying", currentRound: 0, attempt: 2, resumePending: true,
+        workspacePath, sessionId: "same-session",
+      });
+      expect(db.claimRun(run.id)).toMatchObject({
+        attempt: 2, resumePending: true, workspacePath, sessionId: "same-session",
+      });
+    } finally {
+      db.close();
+    }
+  });
+
   it("manually retries a failed run in its existing workspace without replaying completed rounds", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "gamebench-db-manual-resume-"));
     temporaryDirectories.push(directory);

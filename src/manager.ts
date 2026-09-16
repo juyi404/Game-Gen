@@ -84,6 +84,12 @@ export class OrchestratorManager {
     else await this.startExisting(run.experimentId, configOverride);
   }
 
+  async finalizeRun(runId: string): Promise<void> {
+    const run = this.db.getRun(runId);
+    if (!run) throw new Error(`运行不存在: ${runId}`);
+    await this.requireActive(run.experimentId).requestRunFinalization(runId);
+  }
+
   async advanceStage(
     experimentId: string,
     configOverride?: ResolvedBenchmarkConfig,

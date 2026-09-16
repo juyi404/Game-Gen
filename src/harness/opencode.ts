@@ -36,11 +36,15 @@ export interface OpenCodeHarnessOptions {
   pollIntervalMs?: number;
   maxPollErrors?: number;
   idleTimeoutMs?: number;
+  initialBuildSoftTimeoutMs?: number;
+  initialBuildWrapUpMs?: number;
+  transportFetch?: typeof fetch;
 }
 
 export class OpenCodeHarness implements GenerationHarness {
   private client: OpencodeClient | null = null;
   private server: { close(): void } | null = null;
+  private readonly finalizeRequested = new Set<string>();
 
   constructor(
     private readonly config: OpenCodeConfig,
@@ -59,6 +63,29 @@ export class OpenCodeHarness implements GenerationHarness {
     this.server?.close();
     this.server = null;
     this.client = null;
+  }
+
+  async checkInfrastructure(scope: "opencode" | "provider", providerId: string): Promise<void> {
+    const result = await this.requireClient().config.get({
+      signal: AbortSignal.timeout(10_000), throwOnError: true,
+    });
+    if (scope === "opencode") return;
+    const baseURL = result.data.provider?.[providerId]?.options?.baseURL;
+    if (typeof baseURL !== "string") return;
+    const endpoint = new URL(`${baseURL.replace(/\/$/, "")}/models`);
+    if (!['http:', 'https:'].includes(endpoint.protocol) || endpoint.username || endpoint.password) {
+      throw new Error("供应商连通检查地址无效");
+    }
+    endpoint.search = "";
+    // No API key, game prompt, or session history is sent. 401/403/404 show only
+    // that transport works; the single resumed task still probes model health.
+    const response = await (this.options.transportFetch ?? fetch)(endpoint, {
+      method: "GET", redirect: "error", signal: AbortSignal.timeout(10_000),
+    });
+    await response.body?.cancel();
+    if (!response.ok && ![401, 403, 404, 405].includes(response.status)) {
+      throw new Error(`供应商连通检查 HTTP ${response.status}`);
+    }
   }
 
   async beginRun(context: HarnessRunContext): Promise<string> {
@@ -86,16 +113,41 @@ export class OpenCodeHarness implements GenerationHarness {
     const roundMessageIds = new Set(messagesBeforeRound.map((message) => message.info.id));
     let previousMessageIds = roundMessageIds;
     let continuationCount = 0;
+    const maximumContinuations = context.run.resumePending
+      ? 0
+      : MAXIMUM_TRUNCATED_FINISH_CONTINUATIONS;
+    const softLimitMs = roundIndex === 0 ? (this.options.initialBuildSoftTimeoutMs ?? 0) : 0;
+    // A manual retry keeps the original run.startedAt for reporting, but starts a
+    // fresh, bounded recovery window from the time it was explicitly requeued.
+    // Automatic in-place retries retain their session id and therefore keep the
+    // original deadline instead of extending the budget on every transient error.
+    const manuallyRequeued = context.run.resumePending
+      && context.run.workspacePath !== null
+      && context.run.sessionId === null;
+    const budgetStartedAt = manuallyRequeued
+      ? context.run.availableAt
+      : (context.run.startedAt ?? Date.now());
+    const softDeadline = softLimitMs > 0
+      ? budgetStartedAt + softLimitMs : Infinity;
+    const deliveryDeadline = softDeadline + (this.options.initialBuildWrapUpMs ?? 900_000);
+    let wrappingUp = Date.now() >= softDeadline;
     const system = buildWorkspaceSystemPrompt(
       buildEffectiveSystemPrompt(this.systemPrompt, context.model.systemPrompt),
       context.workspacePath,
     );
     while (true) {
+      if (!wrappingUp && Date.now() >= softDeadline) wrappingUp = true;
+      if (Date.now() >= deliveryDeadline) {
+        await this.abortForBudget(context, sessionId);
+        return this.collectBudgetDelivery(context, sessionId, roundMessageIds, roundIndex);
+      }
       const eventMonitor = this.monitorSessionEvents(context, sessionId);
       try {
-        const prompt = continuationCount === 0
-          ? renderRoundPrompt(round.prompt, context, roundIndex)
-          : UNKNOWN_FINISH_CONTINUATION_PROMPT;
+        const prompt = wrappingUp ? INITIAL_BUILD_WRAP_UP_PROMPT : continuationCount === 0
+          ? context.run.resumePending
+            ? RETRY_RESUME_PROMPT
+            : renderRoundPrompt(round.prompt, context, roundIndex)
+          : TRUNCATED_FINISH_CONTINUATION_PROMPT;
         const body = {
           model: {
             providerID: context.model.provider,
@@ -123,7 +175,45 @@ export class OpenCodeHarness implements GenerationHarness {
             : "OpenCode 已接收断尾续作 Prompt，继续使用当前会话和工作目录",
           { sessionId, roundIndex, continuationCount },
         );
-        await this.waitForSessionCompletion(context, sessionId, previousMessageIds, eventMonitor);
+        if (wrappingUp) {
+          context.emit("harness.delivery.started", "warn", "生成时限已到，原会话进入一次限时交付收尾，不再扩展或反复打磨", {
+            sessionId, roundIndex, softDeadline, deliveryDeadline,
+          });
+        }
+        const budgetExpired = await this.waitForSessionCompletion(
+          context, sessionId, previousMessageIds, eventMonitor,
+          wrappingUp ? deliveryDeadline : softDeadline,
+        );
+        if (budgetExpired) {
+          await this.abortForBudget(context, sessionId);
+          if (eventMonitor.error()) throw new Error(`OpenCode 会话失败: ${errorMessage(eventMonitor.error())}`);
+          if (wrappingUp) {
+            return this.collectBudgetDelivery(context, sessionId, roundMessageIds, roundIndex);
+          }
+          eventMonitor.stop();
+          const currentMessages = await this.listSessionMessages(context, sessionId);
+          previousMessageIds = new Set(currentMessages.map((message) => message.info.id));
+          wrappingUp = true;
+          continue;
+        }
+        if (this.finalizeRequested.delete(sessionId)) {
+          const currentMessages = await this.listSessionMessages(context, sessionId);
+          const messages = currentMessages.filter((message) => !roundMessageIds.has(message.info.id));
+          let result: HarnessRoundResult;
+          try {
+            result = summarizeSessionMessages(messages, null);
+          } catch {
+            result = { response: "用户要求停止继续修改，已按现有产物完成本轮验收" };
+          }
+          await validateGeneratedGameArtifacts(context.workspacePath);
+          context.emit(
+            "harness.session.finalized",
+            "info",
+            "已停止继续修改并按现有产物完成验收",
+            { sessionId, roundIndex },
+          );
+          return result;
+        }
         const turnMessages = await this.readCompletedRoundMessages(
           context,
           sessionId,
@@ -133,9 +223,14 @@ export class OpenCodeHarness implements GenerationHarness {
         if (eventMonitor.error()) {
           throw new Error(`OpenCode 会话失败: ${errorMessage(eventMonitor.error())}`);
         }
+        if (wrappingUp) {
+          // A delivery pass is one turn only, including when the upstream truncates it.
+          // Artifact validation still applies; the orchestrator will preserve failures without retrying.
+          return this.collectBudgetDelivery(context, sessionId, roundMessageIds, roundIndex);
+        }
         const finish = latestAssistantFinish(turnMessages);
-        if (finish === "unknown") {
-          if (context.model.provider === "packy-claude-sale") {
+        if (finish === "unknown" || finish === "length") {
+          if (finish === "unknown" && context.model.provider === "packy-claude-sale") {
             try {
               summarizeSessionMessages(turnMessages, eventMonitor.error());
             } catch (error) {
@@ -147,21 +242,26 @@ export class OpenCodeHarness implements GenerationHarness {
               throw error;
             }
           }
-          if (continuationCount >= MAXIMUM_UNKNOWN_FINISH_CONTINUATIONS) {
+          if (continuationCount >= maximumContinuations) {
             throw new Error(
-              `OpenCode 上游响应连续异常结束：finish=unknown，已在原会话续作 ${continuationCount} 次`,
+              `OpenCode 上游响应连续断尾：finish=${finish}，已在原会话续作 ${continuationCount} 次`,
             );
           }
           continuationCount += 1;
           context.emit(
-            "harness.session.unknown_finish",
+            finish === "length"
+              ? "harness.session.length_finish"
+              : "harness.session.unknown_finish",
             "warn",
-            "检测到模型响应异常断尾，将保留当前产物并在原会话自动续作",
+            finish === "length"
+              ? "检测到模型达到单次输出长度上限，将保留当前产物并在原会话自动续作"
+              : "检测到模型响应异常断尾，将保留当前产物并在原会话自动续作",
             {
               sessionId,
               roundIndex,
+              finish,
               continuationCount,
-              maximumContinuations: MAXIMUM_UNKNOWN_FINISH_CONTINUATIONS,
+              maximumContinuations,
             },
           );
           const currentMessages = await this.listSessionMessages(context, sessionId);
@@ -188,6 +288,36 @@ export class OpenCodeHarness implements GenerationHarness {
         eventMonitor.stop();
       }
     }
+  }
+
+  private async abortForBudget(context: HarnessRunContext, sessionId: string): Promise<void> {
+    await this.requireClient().session.abort({
+      path: { id: sessionId },
+      query: { directory: context.workspacePath },
+      signal: controlSignal(context.signal, 10_000),
+      throwOnError: true,
+    });
+  }
+
+  private async collectBudgetDelivery(
+    context: HarnessRunContext,
+    sessionId: string,
+    previousIds: Set<string>,
+    roundIndex: number,
+  ): Promise<HarnessRoundResult> {
+    await validateGeneratedGameArtifacts(context.workspacePath);
+    const messages = (await this.listSessionMessages(context, sessionId))
+      .filter((message) => !previousIds.has(message.info.id));
+    let result: HarnessRoundResult;
+    try {
+      result = summarizeSessionMessages(messages, null);
+    } catch {
+      result = { response: "限时收尾结束，现有产物通过静态验收；未保证已完成所有功能" };
+    }
+    context.emit("harness.delivery.completed", "info", "限时交付结束，现有产物已通过静态验收，不再自动续写", {
+      sessionId, roundIndex,
+    });
+    return result;
   }
 
   async captureRoundContext(
@@ -236,11 +366,28 @@ export class OpenCodeHarness implements GenerationHarness {
     }
   }
 
+  async requestFinalize(sessionId: string, workspacePath: string): Promise<void> {
+    const client = this.requireClient();
+    this.finalizeRequested.add(sessionId);
+    try {
+      await client.session.abort({
+        path: { id: sessionId },
+        query: { directory: workspacePath },
+        signal: AbortSignal.timeout(10_000),
+        throwOnError: true,
+      });
+    } catch (error) {
+      this.finalizeRequested.delete(sessionId);
+      throw error;
+    }
+  }
+
   async releaseRun(
     sessionId: string | null,
     workspacePath: string,
     options: { preserveSession?: boolean } = {},
   ): Promise<void> {
+    if (sessionId) this.finalizeRequested.delete(sessionId);
     const client = this.client;
     if (!client) return;
     const errors: string[] = [];
@@ -386,11 +533,13 @@ export class OpenCodeHarness implements GenerationHarness {
     sessionId: string,
     previousMessageIds: Set<string>,
     monitor: SessionEventMonitor,
-  ): Promise<void> {
+    stopAt = Infinity,
+  ): Promise<boolean> {
     let consecutiveErrors = 0;
     const maxPollErrors = this.options.maxPollErrors ?? 10;
     while (!monitor.isComplete()) {
       throwIfAborted(context.signal);
+      if (Date.now() >= stopAt) return true;
       const idleTimeoutMs = this.options.idleTimeoutMs ?? 0;
       if (idleTimeoutMs > 0 && Date.now() - monitor.lastActivityAt() >= idleTimeoutMs) {
         throw new Error(`模型连续 ${idleTimeoutMs}ms 没有产生执行事件，已触发空闲超时`);
@@ -403,13 +552,13 @@ export class OpenCodeHarness implements GenerationHarness {
         });
         consecutiveErrors = 0;
         const status = result.data[sessionId];
-        if (status?.type === "idle") return;
+        if (status?.type === "idle") return false;
         if (!status) {
           const messages = await this.listSessionMessages(context, sessionId);
           const currentRoundMessages = messages.filter(
             (message) => !previousMessageIds.has(message.info.id),
           );
-          if (hasTerminalAssistantMessage(currentRoundMessages)) return;
+          if (hasTerminalAssistantMessage(currentRoundMessages)) return false;
         }
       } catch (error) {
         throwIfAborted(context.signal);
@@ -424,8 +573,9 @@ export class OpenCodeHarness implements GenerationHarness {
           throw new Error(`OpenCode 状态连接连续失败 ${consecutiveErrors} 次: ${errorMessage(error)}`);
         }
       }
-      await monitor.wait(this.options.pollIntervalMs ?? 5_000, context.signal);
+      await monitor.wait(Math.min(this.options.pollIntervalMs ?? 5_000, Math.max(1, stopAt - Date.now())), context.signal);
     }
+    return false;
   }
 
   private async readCompletedRoundMessages(
@@ -479,8 +629,24 @@ export function createHarness(config: ResolvedBenchmarkConfig): GenerationHarnes
   if (config.runtime.harness === "mock") return new MockHarnessProxy(config);
   return new OpenCodeHarness(config.opencode, config.systemPrompt, {
     idleTimeoutMs: config.runtime.roundIdleTimeoutMs,
+    initialBuildSoftTimeoutMs: config.runtime.initialBuildSoftTimeoutMs ?? 0,
+    initialBuildWrapUpMs: config.runtime.initialBuildWrapUpMs ?? 900_000,
   });
 }
+
+const INITIAL_BUILD_WRAP_UP_PROMPT = [
+  "本游戏的生成时间预算已用完，现在只做一次交付收尾。保留当前工作目录、会话和已有成果。",
+  "停止新增功能、美术扩展、重构和反复优化；只补齐让当前游戏能够加载、进入核心玩法并运行所必需的缺失内容。",
+  "修复阻断运行的语法错误、缺失文件和入口引用，做一次最小运行检查，然后立即结束并简述交付结果与尚存限制。",
+  "不要重新生成、覆盖已有成果或重启设计。收尾最多十五分钟，优先立即交付现有可运行版本。",
+].join("\n");
+
+const RETRY_RESUME_PROMPT = [
+  "上一轮执行因临时错误中断。请在当前同一工作目录和会话中直接续跑。",
+  "先检查已有文件与未完成内容，保留所有可用成果；不要从零重建、不要覆盖已完成部分，也不要重新规划或扩展需求。",
+  "如果必须补写较大的源文件，请先建立可运行骨架，再用多次小范围编辑或追加逐块完成；不要在单次工具调用中写入整个大型文件，以免再次达到响应长度上限。",
+  "继续完成当前轮原始任务，优先修复阻断加载、核心玩法和交付的事项，然后尽快结束。",
+].join("\n");
 
 class MockHarnessProxy implements GenerationHarness {
   private delegate: GenerationHarness | null = null;
@@ -592,10 +758,12 @@ export function summarizeSessionMessages(
   return { response, usage };
 }
 
-const MAXIMUM_UNKNOWN_FINISH_CONTINUATIONS = 3;
-const UNKNOWN_FINISH_CONTINUATION_PROMPT = [
-  "The previous model turn ended unexpectedly before the game was complete.",
-  "Continue from the files already present in the current workspace; do not restart or merely describe a plan.",
+// A truncated/unknown finish may be a transient stream cutoff. Allow exactly one
+// same-session continuation, then let the scheduler apply its automatic backoff.
+const MAXIMUM_TRUNCATED_FINISH_CONTINUATIONS = 1;
+const TRUNCATED_FINISH_CONTINUATION_PROMPT = [
+  "The previous model turn ended before the game was complete, possibly because it reached the provider output limit.",
+  "Continue from the files already present in the current workspace and complete any interrupted tool or file write; do not restart or merely describe a plan.",
   "Finish the requested playable game, ensure index.html is no longer the placeholder, and verify every local file reference.",
   "Only finish your response after the implementation is complete.",
 ].join(" ");

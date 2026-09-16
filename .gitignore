@@ -6,6 +6,9 @@ examples/output/
 examples/.data/
 coverage/
 .deploy/
+.codex-tmp/
+reports/
+scripts/probe-fable51-private.py
 *.log
 .env
 .env.*

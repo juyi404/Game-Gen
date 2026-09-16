@@ -95,6 +95,18 @@ describe("generated game artifact validation", () => {
       ({ readFile }) => readFile(path.join(directory, "index.html"), "utf8"),
     ))).toEqual(["/src/game.css?v=1", "/src/game.js#build"]);
   });
+
+  it("ignores data URLs containing markup delimiters", async () => {
+    const directory = await workspace();
+    await writeFile(
+      path.join(directory, "index.html"),
+      `<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg'><circle r='8'/></svg>"><main>Game</main><img src="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg'></svg>">`,
+      "utf8",
+    );
+    await expect(validateGeneratedGameArtifacts(directory)).resolves.toBeUndefined();
+    expect(localEntryReferences(await readFile(path.join(directory, "index.html"), "utf8")))
+      .toEqual([]);
+  });
 });
 
 async function workspace(): Promise<string> {

@@ -45,8 +45,7 @@ interface InfrastructureProbe {
 }
 
 const MINIMUM_INFRASTRUCTURE_COOLDOWN_MS = 60_000;
-const MAXIMUM_INFRASTRUCTURE_COOLDOWN_MS = 5 * 60_000;
-const MAXIMUM_INFRASTRUCTURE_FAILURES_PER_RUN = 4;
+const MAXIMUM_INFRASTRUCTURE_COOLDOWN_MS = 15 * 60_000;
 const MAXIMUM_INFRASTRUCTURE_OUTAGE_MS = 30 * 60_000;
 
 export class GenerationOrchestrator extends EventEmitter {
@@ -150,6 +149,24 @@ export class GenerationOrchestrator extends EventEmitter {
     void this.pump();
   }
 
+  async requestRunFinalization(runId: string): Promise<void> {
+    const active = this.active.get(runId);
+    if (!active?.sessionId || !active.workspacePath) {
+      throw new Error("该运行当前没有可收尾的活动 OpenCode 会话");
+    }
+    if (!this.harness.requestFinalize) {
+      throw new Error("当前生成 Harness 不支持显式收尾");
+    }
+    this.emitRunEvent(
+      runId,
+      "run.finalization.requested",
+      "info",
+      "用户要求停止继续修改并按现有产物收尾",
+      { sessionId: active.sessionId, workspacePath: active.workspacePath },
+    );
+    await this.harness.requestFinalize(active.sessionId, active.workspacePath);
+  }
+
   async cancel(): Promise<void> {
     if (this.settled || this.cancelling) return;
     this.cancelling = true;
@@ -226,7 +243,8 @@ export class GenerationOrchestrator extends EventEmitter {
       );
       if (this.openCodeCircuit) {
         const probe = runnable.find((run) => this.hasCapacity(run, now));
-        if (probe) {
+        if (probe && await this.checkCircuitTransport(probe, "opencode")) {
+          if (this.paused || this.shuttingDown || this.cancelling) return;
           const claimed = this.db.claimRun(probe.id);
           if (claimed) {
             this.openCodeCircuit.probeInFlight = true;
@@ -254,6 +272,9 @@ export class GenerationOrchestrator extends EventEmitter {
       for (const run of runnable) {
         if (this.active.size >= this.config.runtime.globalConcurrency) break;
         if (!this.hasCapacity(run, now)) continue;
+        if (this.providerCircuits.has(run.providerId)
+          && !await this.checkCircuitTransport(run, "provider")) continue;
+        if (this.paused || this.shuttingDown || this.cancelling) return;
         const claimed = this.db.claimRun(run.id);
         if (!claimed) continue;
         const probes: InfrastructureProbe[] = [];
@@ -350,7 +371,11 @@ export class GenerationOrchestrator extends EventEmitter {
     const emit: HarnessRunContext["emit"] = (type, level, message, data = {}) => {
       this.db.appendEvent(this.experiment.id, run.id, type, level, message, data);
       if (type === "harness.step.completed") {
-        this.acknowledgeInfrastructureProbe(active, "provider", run.id, run.providerId);
+        if (!['unknown', 'length'].includes(String(data.reason))) {
+          this.acknowledgeInfrastructureProbe(active, "provider", run.id, run.providerId);
+        }
+        // Keep the retry counter until a round succeeds: a single model step
+        // must not reset the backoff for a repeatedly failing round.
       }
     };
 
@@ -406,7 +431,10 @@ export class GenerationOrchestrator extends EventEmitter {
         const deadline = createDeadline(active.controller.signal, timeoutMs);
         this.db.updateRound(run.id, roundIndex, "running");
         this.db.updateRun(run.id, { currentRound: roundIndex + 1 });
-        const roundContext: HarnessRunContext = { ...baseContext, signal: deadline.signal };
+        const roundContext: HarnessRunContext = {
+          ...baseContext, signal: deadline.signal,
+          run: { ...run, resumePending: run.resumePending && roundIndex === startRound },
+        };
         try {
           const initializedContextPath = await this.archiveRoundContext(
             run.id,
@@ -547,6 +575,15 @@ export class GenerationOrchestrator extends EventEmitter {
         await this.releaseHarnessRun(run.id, active, false);
         return;
       }
+      const softLimitMs = this.config.runtime.initialBuildSoftTimeoutMs ?? 0;
+      if (softLimitMs > 0 && this.db.getRounds(run.id)[0]?.status !== "completed" && run.startedAt !== null
+        && Date.now() >= run.startedAt + softLimitMs) {
+        this.db.updateRun(run.id, { status: "failed", error: message });
+        await this.writeAttemptResultSafely(run.id, active.workspacePath, "failed", message, true);
+        this.emitRunEvent(run.id, "run.delivery.blocked", "error", "限时收尾未通过验收，已保留产物和 Session，停止自动重试等待人工决定", { error: message });
+        await this.releaseHarnessRun(run.id, active, true);
+        return;
+      }
       if (isProviderAuthorizationBlock(message)) {
         const firstBlock = !this.paused;
         this.paused = true;
@@ -573,10 +610,7 @@ export class GenerationOrchestrator extends EventEmitter {
       }
       if (isRecoverableUnknownFinish(message)) {
         const failureState = this.db.recordInfrastructureFailure(run.id);
-        const retryExhausted =
-          failureState.attempts >= MAXIMUM_INFRASTRUCTURE_FAILURES_PER_RUN ||
-          (failureState.firstFailedAt !== null &&
-            Date.now() - failureState.firstFailedAt >= MAXIMUM_INFRASTRUCTURE_OUTAGE_MS);
+        const retryExhausted = this.recoveryBudgetExpired(run, failureState.firstFailedAt);
         if (retryExhausted) {
           this.db.updateRun(run.id, { status: "failed", error: message });
           await this.writeAttemptResultSafely(run.id, active.workspacePath, "failed", message);
@@ -584,33 +618,29 @@ export class GenerationOrchestrator extends EventEmitter {
             run.id,
             "run.continuation.blocked",
             "error",
-            "该任务连续断尾，已停止单任务自动续作并保留现场等待人工处理",
+            "该任务已到生成时间预算，已停止自动续写并保留产物和 Session",
             {
               error: message,
               continuationAttempts: failureState.attempts,
               firstFailedAt: failureState.firstFailedAt,
-              maximumAttempts: MAXIMUM_INFRASTRUCTURE_FAILURES_PER_RUN,
-              maximumDurationMs: MAXIMUM_INFRASTRUCTURE_OUTAGE_MS,
+              timeBudgetMs: this.config.runtime.initialBuildSoftTimeoutMs || MAXIMUM_INFRASTRUCTURE_OUTAGE_MS,
             },
           );
-          await this.releaseHarnessRun(run.id, active, false);
+          await this.releaseHarnessRun(run.id, active, true);
           return;
         }
-        const delayMs = Math.min(
-          MAXIMUM_INFRASTRUCTURE_COOLDOWN_MS,
-          this.config.runtime.retryBackoffMs * 2 ** Math.max(failureState.attempts - 1, 0),
-        );
+        const delayMs = this.recoveryDelayMs(run, failureState.attempts);
         this.db.retryRun(run.id, delayMs, message, { preserveProgress: true });
         await this.writeAttemptResultSafely(run.id, active.workspacePath, "failed", message, true);
         this.emitRunEvent(
           run.id,
           "run.continuation.retrying",
           "warn",
-          "该任务连续断尾，已保留 Session 与产物等待单任务续作；其他任务继续补满并发",
+          "该任务断尾，已保留 Session 与产物自动续跑；恢复后不再嵌套续写",
           {
             error: message,
             continuationAttempts: failureState.attempts,
-            remainingRetries: MAXIMUM_INFRASTRUCTURE_FAILURES_PER_RUN - failureState.attempts,
+            automaticRecovery: true,
             delayMs,
           },
         );
@@ -620,10 +650,7 @@ export class GenerationOrchestrator extends EventEmitter {
       const infrastructureScope = classifyInfrastructureFailure(message);
       if (infrastructureScope) {
         const failureState = this.db.recordInfrastructureFailure(run.id);
-        const infrastructureExhausted =
-          failureState.attempts >= MAXIMUM_INFRASTRUCTURE_FAILURES_PER_RUN ||
-          (failureState.firstFailedAt !== null &&
-            Date.now() - failureState.firstFailedAt >= MAXIMUM_INFRASTRUCTURE_OUTAGE_MS);
+        const infrastructureExhausted = this.recoveryBudgetExpired(run, failureState.firstFailedAt);
         const delayMs = this.tripInfrastructureCircuit(
           infrastructureScope,
           run.providerId,
@@ -637,30 +664,29 @@ export class GenerationOrchestrator extends EventEmitter {
             run.id,
             "run.infrastructure.blocked",
             "error",
-            "基础设施持续不可用，已停止自动重试并等待人工处理",
+            "基础设施故障持续到生成时间预算结束，已保留产物和 Session",
             {
               error: message,
               scope: infrastructureScope,
               providerId: infrastructureScope === "provider" ? run.providerId : null,
               infrastructureAttempts: failureState.attempts,
               firstFailedAt: failureState.firstFailedAt,
-              maximumAttempts: MAXIMUM_INFRASTRUCTURE_FAILURES_PER_RUN,
-              maximumOutageMs: MAXIMUM_INFRASTRUCTURE_OUTAGE_MS,
+              timeBudgetMs: this.config.runtime.initialBuildSoftTimeoutMs || MAXIMUM_INFRASTRUCTURE_OUTAGE_MS,
             },
           );
-          await this.releaseHarnessRun(run.id, active, false);
+          await this.releaseHarnessRun(run.id, active, true);
           return;
         }
-        this.db.retryRun(run.id, delayMs, message, { preserveProgress: true });
+        const runDelayMs = Math.max(delayMs, this.recoveryDelayMs(run, failureState.attempts));
+        this.db.retryRun(run.id, runDelayMs, message, { preserveProgress: true });
         await this.writeAttemptResultSafely(run.id, active.workspacePath, "failed", message, true);
         this.emitRunEvent(run.id, "run.infrastructure.retrying", "warn", "基础设施连接失败，已熔断对应线路并保留已完成进度", {
           error: message,
           attempt: run.attempt,
           maxAttempts: run.maxAttempts,
           infrastructureAttempts: failureState.attempts,
-          remainingInfrastructureRetries:
-            MAXIMUM_INFRASTRUCTURE_FAILURES_PER_RUN - failureState.attempts,
-          delayMs,
+          automaticRecovery: true,
+          delayMs: runDelayMs,
           scope: infrastructureScope,
           providerId: infrastructureScope === "provider" ? run.providerId : null,
         });
@@ -672,7 +698,11 @@ export class GenerationOrchestrator extends EventEmitter {
       if (run.attempt < run.maxAttempts) {
         const delayMs = this.config.runtime.retryBackoffMs * 2 ** Math.max(run.attempt - 1, 0);
         const repairInPlace = isRepairableArtifactFailure(message) || isHardRoundTimeout(message);
-        this.db.retryRun(run.id, delayMs, message, { preserveSession: repairInPlace });
+        this.db.retryRun(run.id, delayMs, message, {
+          preserveProgress: true,
+          preserveSession: true,
+          incrementAttempt: true,
+        });
         await this.writeAttemptResultSafely(run.id, active.workspacePath, "failed", message, true);
         this.emitRunEvent(
           run.id,
@@ -682,16 +712,17 @@ export class GenerationOrchestrator extends EventEmitter {
             ? "轮次达到硬超时，已保留工作区与 Session 等待原会话续跑"
             : repairInPlace
               ? "产物验收失败，已保留工作区与 Session 等待原地修复"
-            : "运行失败，等待自动重试",
+            : "运行失败，已保留原工作区与 Session 等待续跑",
           {
             error: message,
             attempt: run.attempt,
             nextAttempt: run.attempt + 1,
             delayMs,
             repairInPlace,
+            resumedInPlace: true,
           },
         );
-        await this.releaseHarnessRun(run.id, active, repairInPlace);
+        await this.releaseHarnessRun(run.id, active, true);
       } else {
         this.db.updateRun(run.id, { status: "failed", error: message });
         await this.writeAttemptResultSafely(run.id, active.workspacePath, "failed", message);
@@ -699,8 +730,49 @@ export class GenerationOrchestrator extends EventEmitter {
           error: message,
           attempts: run.attempt,
         });
-        await this.releaseHarnessRun(run.id, active, false);
+        await this.releaseHarnessRun(run.id, active, true);
       }
+    }
+  }
+
+  private recoveryBudgetExpired(run: RunRecord, firstFailedAt: number | null): boolean {
+    const budgetMs = this.config.runtime.initialBuildSoftTimeoutMs ?? 0;
+    const end = budgetMs > 0 && run.startedAt !== null
+      ? run.startedAt + budgetMs
+      : (firstFailedAt ?? Date.now()) + MAXIMUM_INFRASTRUCTURE_OUTAGE_MS;
+    return Date.now() >= end;
+  }
+
+  private recoveryDelayMs(run: RunRecord, failures: number): number {
+    const delayMs = Math.min(MAXIMUM_INFRASTRUCTURE_COOLDOWN_MS,
+      Math.max(MINIMUM_INFRASTRUCTURE_COOLDOWN_MS, this.config.runtime.retryBackoffMs)
+      * 2 ** Math.min(Math.max(failures - 1, 0), 10));
+    const budgetMs = this.config.runtime.initialBuildSoftTimeoutMs ?? 0;
+    return budgetMs > 0 && run.startedAt !== null
+      ? Math.max(1, Math.min(delayMs, run.startedAt + budgetMs - Date.now()))
+      : delayMs;
+  }
+
+  private async checkCircuitTransport(run: RunRecord, scope: InfrastructureScope): Promise<boolean> {
+    if (!this.harness.checkInfrastructure) return true;
+    try {
+      await this.harness.checkInfrastructure(scope, run.providerId);
+      return true;
+    } catch {
+      if (this.shuttingDown || this.cancelling) return false;
+      // A read-only transport failure never submits a game prompt or uses an
+      // attempt. Leave the task eligible for automatic recovery after backoff.
+      const message = "基础设施只读连通检查失败，已自动延长冷却（未提交模型请求）";
+      const failureState = this.db.recordInfrastructureFailure(run.id);
+      const delayMs = this.tripInfrastructureCircuit(scope, run.providerId, message, true);
+      if (this.recoveryBudgetExpired(run, failureState.firstFailedAt)) {
+        this.db.updateRun(run.id, { status: "failed", error: message });
+        this.emitRunEvent(run.id, "run.delivery.blocked", "error", "连接故障持续到时间预算结束，现场已保留", { scope });
+      } else {
+        this.db.updateRun(run.id, { status: "retrying", error: `${scope === 'provider' ? 'upstream_error' : 'fetch failed'}: ${message}`,
+          availableAt: Date.now() + Math.max(delayMs, this.recoveryDelayMs(run, failureState.attempts)) });
+      }
+      return false;
     }
   }
 
@@ -724,7 +796,7 @@ export class GenerationOrchestrator extends EventEmitter {
     );
     const delayMs = Math.min(
       MAXIMUM_INFRASTRUCTURE_COOLDOWN_MS,
-      baseDelayMs * 2 ** Math.max(failureCount - 1, 0),
+      baseDelayMs * 2 ** Math.min(Math.max(failureCount - 1, 0), 10),
     );
     const blockedUntil = reopening ? now + delayMs : previous.blockedUntil;
     const circuit: InfrastructureCircuit = {
@@ -1110,7 +1182,7 @@ function classifyInfrastructureFailure(message: string): InfrastructureScope | n
 }
 
 function isRecoverableUnknownFinish(message: string): boolean {
-  return /OpenCode 上游响应连续异常结束：finish=unknown/i.test(message);
+  return /OpenCode 上游响应连续(?:异常结束|断尾)：finish=(?:unknown|length)/i.test(message);
 }
 
 function isProviderAuthorizationBlock(message: string): boolean {

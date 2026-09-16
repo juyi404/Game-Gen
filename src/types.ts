@@ -80,6 +80,10 @@ export interface RuntimeConfig {
   dataDir: string;
   roundTimeoutMs: number;
   roundIdleTimeoutMs: number;
+  /** Initial build budget, measured from the persisted first run start (not reset on retry). */
+  initialBuildSoftTimeoutMs?: number;
+  /** Bounded same-session delivery pass after the initial build budget. */
+  initialBuildWrapUpMs?: number;
   maxAttempts: number;
   retryBackoffMs: number;
   workspaceTemplate?: string;
@@ -261,6 +265,8 @@ export interface HarnessRoundResult {
 export interface GenerationHarness {
   start(): Promise<void>;
   stop(): Promise<void>;
+  /** Read-only transport check. Must not create a session or call a generation endpoint. */
+  checkInfrastructure?(scope: "opencode" | "provider", providerId: string): Promise<void>;
   beginRun(context: HarnessRunContext): Promise<string>;
   executeRound(
     context: HarnessRunContext,
@@ -275,6 +281,7 @@ export interface GenerationHarness {
     roundIndex: number,
   ): Promise<unknown>;
   abortRun(sessionId: string, workspacePath: string): Promise<void>;
+  requestFinalize?(sessionId: string, workspacePath: string): Promise<void>;
   releaseRun?(
     sessionId: string | null,
     workspacePath: string,

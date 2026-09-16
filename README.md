@@ -33,7 +33,7 @@ OpenCode CLI 和 SDK 已列为项目依赖，执行依赖安装时会一并安�
 Windows PowerShell 推荐使用以下命令。使用 `npm.cmd` 可以避开部分电脑的 PowerShell 脚本执行策略限制。
 
 ```powershell
-git clone https://github.com/XiaoQiangSHI/Game-Gen.git
+git clone https://github.com/juyi404/Game-Gen.git
 cd Game-Gen
 node --version
 npm.cmd ci

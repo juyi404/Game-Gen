@@ -314,6 +314,13 @@ export class DashboardServer {
       return;
     }
 
+    const finalizeMatch = pathname.match(/^\/api\/runs\/([^/]+)\/finalize$/);
+    if (request.method === "POST" && finalizeMatch) {
+      await this.manager.finalizeRun(finalizeMatch[1]!);
+      sendJson(response, 200, { ok: true });
+      return;
+    }
+
     if (request.method === "GET" && pathname === "/api/stream") {
       const experimentId = url.searchParams.get("experimentId");
       if (!experimentId || !this.db.getExperiment(experimentId)) {
@@ -444,6 +451,8 @@ function publicExperiment(experiment: ExperimentRecord) {
     manifestPath: experimentManifestPath(config, experiment.id),
     settings: {
       globalConcurrency: config.runtime.globalConcurrency,
+      initialBuildSoftTimeoutMs: config.runtime.initialBuildSoftTimeoutMs ?? 0,
+      initialBuildWrapUpMs: config.runtime.initialBuildWrapUpMs ?? 900_000,
       providerConcurrency: config.runtime.providerConcurrency,
       harness: config.runtime.harness,
       stageMode: config.runtime.stageMode,

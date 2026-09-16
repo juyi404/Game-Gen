@@ -472,7 +472,11 @@ export class BenchmarkDatabase extends EventEmitter {
     id: string,
     delayMs: number,
     error: string,
-    options: { preserveProgress?: boolean; preserveSession?: boolean } = {},
+    options: {
+      preserveProgress?: boolean;
+      preserveSession?: boolean;
+      incrementAttempt?: boolean;
+    } = {},
   ): void {
     const now = Date.now();
     if (options.preserveProgress) {
@@ -491,11 +495,12 @@ export class BenchmarkDatabase extends EventEmitter {
                 SELECT COUNT(*) FROM rounds
                 WHERE rounds.run_id = runs.id AND rounds.status = 'completed'
               ),
-              resume_pending = 1, error = ?, available_at = ?, completed_at = NULL,
+              attempt = attempt + ?, resume_pending = 1,
+              error = ?, available_at = ?, completed_at = NULL,
               updated_at = ?
             WHERE id = ?
           `)
-          .run(error, now + delayMs, now, id);
+          .run(options.incrementAttempt ? 1 : 0, error, now + delayMs, now, id);
       });
       return;
     }
