@@ -19,6 +19,7 @@
   },
   "dependencies": {
     "@opencode-ai/sdk": "1.18.18",
+    "acorn": "8.18.0",
     "opencode-ai": "1.18.18",
     "zod": "^4.0.0"
   },

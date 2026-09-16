@@ -1,19 +1,13 @@
 import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
-import type {
-  GenerationHarness,
-  HarnessRoundResult,
-  HarnessRunContext,
-  MockConfig,
-  RoundDefinition,
-} from "../types.js";
+import type { GenerationHarness, HarnessRoundResult, HarnessRunContext, MockConfig, RoundDefinition } from "../domain/types.js";
 
 export class MockHarness implements GenerationHarness {
-  constructor(private readonly config: MockConfig) {}
+  constructor(private readonly config: MockConfig) { }
 
-  async start(): Promise<void> {}
+  async start(): Promise<void> { }
 
-  async stop(): Promise<void> {}
+  async stop(): Promise<void> { }
 
   async beginRun(context: HarnessRunContext): Promise<string> {
     context.emit("harness.session.created", "info", "模拟会话已创建");
@@ -70,7 +64,7 @@ export class MockHarness implements GenerationHarness {
     };
   }
 
-  async abortRun(): Promise<void> {}
+  async abortRun(): Promise<void> { }
 }
 
 function renderGame(title: string, modelId: string): string {

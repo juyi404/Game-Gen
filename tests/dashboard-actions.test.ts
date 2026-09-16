@@ -1,6 +1,7 @@
 import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { parse } from "acorn";
 import { afterEach, describe, expect, it } from "vitest";
 import { ControlPlane } from "../src/control-plane.js";
 import { BenchmarkDatabase } from "../src/database.js";
@@ -24,6 +25,48 @@ afterEach(async () => {
 });
 
 describe("dashboard lifecycle actions", () => {
+  it("maps missing lifecycle command targets to 404 without starting a runtime", async () => {
+    const fixture = await createFixture();
+    try {
+      expect((await postJson(fixture.url, "/api/experiments/missing/advance-stage", {})).response.status).toBe(404);
+      expect((await postJson(fixture.url, "/api/runs/missing/retry", {})).response.status).toBe(404);
+      expect(fixture.manager.activeExperimentId).toBeNull();
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("serves the full browser module graph as JavaScript and keeps private paths unavailable", async () => {
+    const fixture = await createFixture();
+    try {
+      const pending = ["/app.js"];
+      const visited = new Set<string>();
+      while (pending.length > 0) {
+        const pathname = pending.pop()!;
+        if (visited.has(pathname)) continue;
+        visited.add(pathname);
+        const response = await fetch(`${fixture.url}${pathname}`);
+        expect(response.status, pathname).toBe(200);
+        expect(response.headers.get("content-type"), pathname).toContain("javascript");
+        expect(response.headers.get("x-content-type-options")).toBe("nosniff");
+        const ast = parse(await response.text(), { ecmaVersion: "latest", sourceType: "module" });
+        for (const statement of ast.body) {
+          if (statement.type !== "ImportDeclaration") continue;
+          const dependency = new URL(String(statement.source.value), `${fixture.url}${pathname}`);
+          expect(dependency.origin).toBe(fixture.url);
+          pending.push(dependency.pathname);
+        }
+      }
+      expect(visited.has("/modules/monitor.js")).toBe(true);
+      expect(visited.has("/modules/api.js")).toBe(true);
+      for (const pathname of ["/modules/missing.js", "/modules/state.ts", "/modules/state.js.map", "/domain/types.ts", "/modules/%2e%2e%2fapplication%2fcontracts.ts"]) {
+        expect((await fetch(`${fixture.url}${pathname}`)).status, pathname).toBe(404);
+      }
+    } finally {
+      await fixture.close();
+    }
+  });
+
   it("pauses, resumes, streams, cancels, retries, and serves artifacts", async () => {
     const fixture = await createFixture();
     try {

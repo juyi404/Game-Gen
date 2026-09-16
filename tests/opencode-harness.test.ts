@@ -21,6 +21,43 @@ afterEach(async () => {
 });
 
 describe("OpenCode harness message errors", () => {
+  it("translates SDK failures at both session and round entry points", async () => {
+    const client = {
+      session: {
+        create: async () => { throw new Error("fetch failed"); },
+        messages: async () => { throw new Error("invalid_api_key"); },
+      },
+    } as unknown as OpencodeClient;
+    const harness = new OpenCodeHarness(openCodeConfig(), "system", {
+      connect: async () => ({ client, server: null, url: "http://127.0.0.1:4096" }),
+    });
+    await harness.start();
+    try {
+      const context = runContext("test-workspace");
+      await expect(harness.beginRun(context)).rejects.toMatchObject({
+        kind: "infrastructure", scope: "engine", retryable: true,
+      });
+      await expect(harness.executeRound(context, "session-1", round(), 0)).rejects.toMatchObject({
+        kind: "authorization", scope: "provider", retryable: false,
+      });
+    } finally { await harness.stop(); }
+  });
+
+  it("accepts the generic engine scope without making a provider request", async () => {
+    const state: FakeState = { accepted: false, promptCalled: false, statusCalls: 0 };
+    const client = fakeClient(state, completedMessages());
+    const transportFetch = vi.fn<typeof fetch>();
+    const harness = new OpenCodeHarness(openCodeConfig(), "system", {
+      connect: async () => ({ client, server: null, url: "http://127.0.0.1:4096" }), transportFetch,
+    });
+    await harness.start();
+    try {
+      await expect(harness.checkInfrastructure("engine", "packy-test")).resolves.toBeUndefined();
+      expect(transportFetch).not.toHaveBeenCalled();
+      expect(state.promptCalls ?? 0).toBe(0);
+    } finally { await harness.stop(); }
+  });
+
   it.each([401, 502])("checks transport without a key, prompt, or session for HTTP %i", async (status) => {
     const state: FakeState = { accepted: false, promptCalled: false, statusCalls: 0 };
     const client = fakeClient(state, completedMessages());
@@ -31,7 +68,10 @@ describe("OpenCode harness message errors", () => {
     await harness.start();
     try {
       const check = harness.checkInfrastructure("provider", "packy-test");
-      if (status === 502) await expect(check).rejects.toThrow("HTTP 502");
+      if (status === 502) await expect(check).rejects.toMatchObject({
+        kind: "infrastructure", scope: "provider", retryable: true,
+        message: "供应商连通检查 HTTP 502",
+      });
       else await expect(check).resolves.toBeUndefined();
       expect(String(transportFetch.mock.calls[0]![0])).toBe("https://example.com/v1/models");
       expect(transportFetch.mock.calls[0]![1]).toMatchObject({ method: "GET", redirect: "error" });
@@ -71,6 +111,7 @@ describe("OpenCode harness message errors", () => {
     context.run.resumePending = true;
     context.run.startedAt = Date.now() - 10_000;
     context.run.availableAt = Date.now();
+    context.run.initialBuildStartedAt = context.run.availableAt;
     context.run.sessionId = null;
     await harness.start();
     await expect(harness.executeRound(context, "recovery-session", round(), 0))
@@ -157,6 +198,67 @@ describe("OpenCode harness message errors", () => {
     expect(state.prompts?.[0]).toContain("只做一次交付收尾");
     expect(state.aborted).toBe(true);
     await harness.stop();
+  });
+
+  it.each([false, true])("handles expected abort events at both budget boundaries (busy delivery: %s)", async (busyDelivery) => {
+    const workspacePath = await createWorkspace("<main>game</main><script>window.game = true;</script>");
+    const state: FakeState = { accepted: false, promptCalled: false, statusCalls: 0, stuckBusy: true };
+    state.onPrompt = (call) => { if (call === 2) state.stuckBusy = busyDelivery; };
+    const client = fakeClient(state, (call) => completedMessages(`assistant-${call}`));
+    installAbortEvents(client, { name: "MessageAbortedError", data: { message: "Aborted" } });
+    const harness = new OpenCodeHarness(openCodeConfig(), "system", {
+      connect: async () => ({ client, server: null, url: "http://127.0.0.1:4096" }),
+      pollIntervalMs: 1, initialBuildSoftTimeoutMs: 100, initialBuildWrapUpMs: 200,
+    });
+    const context = runContext(workspacePath);
+    const events: string[] = [];
+    context.emit = (type) => { events.push(type); };
+    await harness.start();
+    context.run.startedAt = Date.now();
+    try {
+      await expect(harness.executeRound(context, "session-1", round(), 0)).resolves.toBeDefined();
+      expect(state.promptSessions).toEqual(["session-1", "session-1"]);
+      expect(events.filter((type) => type === "harness.session.budget_aborted")).toHaveLength(busyDelivery ? 2 : 1);
+      expect(events).toContain("harness.delivery.started");
+      expect(events).toContain("harness.delivery.completed");
+      expect(events).not.toContain("harness.session.error");
+    } finally { await harness.stop(); }
+  });
+
+  it("preserves a provider error received during budget cancellation", async () => {
+    const workspacePath = await createWorkspace("<main>game</main><script>window.game = true;</script>");
+    const state: FakeState = { accepted: false, promptCalled: false, statusCalls: 0, stuckBusy: true };
+    const client = fakeClient(state, completedMessages());
+    installAbortEvents(client, { name: "APIError", data: { message: "upstream unavailable" } });
+    const harness = new OpenCodeHarness(openCodeConfig(), "system", {
+      connect: async () => ({ client, server: null, url: "http://127.0.0.1:4096" }),
+      pollIntervalMs: 1, initialBuildSoftTimeoutMs: 100, initialBuildWrapUpMs: 200,
+    });
+    await harness.start();
+    const context = runContext(workspacePath);
+    context.run.startedAt = Date.now();
+    try {
+      await expect(harness.executeRound(context, "session-1", round(), 0)).rejects.toThrow("upstream unavailable");
+      expect(state.promptCalls).toBe(1);
+    } finally { await harness.stop(); }
+  });
+
+  it("does not suppress an unsolicited abort before the budget expires", async () => {
+    const workspacePath = await createWorkspace("<main>game</main><script>window.game = true;</script>");
+    const state: FakeState = { accepted: false, promptCalled: false, statusCalls: 0 };
+    const client = fakeClient(state, completedMessages(), [{
+      type: "session.error", properties: { sessionID: "session-1", error: { name: "MessageAbortedError", data: { message: "Aborted" } } },
+    }]);
+    const harness = new OpenCodeHarness(openCodeConfig(), "system", {
+      connect: async () => ({ client, server: null, url: "http://127.0.0.1:4096" }),
+      pollIntervalMs: 1, initialBuildSoftTimeoutMs: 1000,
+    });
+    await harness.start();
+    const context = runContext(workspacePath);
+    context.run.startedAt = Date.now();
+    try {
+      await expect(harness.executeRound(context, "session-1", round(), 0)).rejects.toThrow("MessageAbortedError");
+    } finally { await harness.stop(); }
   });
 
   it("does not reset the deadline on recovery or pass invalid artifacts", async () => {
@@ -475,6 +577,26 @@ describe("OpenCode harness message errors", () => {
   });
 });
 
+function installAbortEvents(client: OpencodeClient, error: unknown): void {
+  let sendAbort: (() => void) | undefined;
+  let eventHandled: Promise<void> = Promise.resolve();
+  client.event.subscribe = vi.fn(async () => {
+    const requested = new Promise<void>((resolve) => { sendAbort = resolve; });
+    let acknowledge!: () => void;
+    eventHandled = new Promise<void>((resolve) => { acknowledge = resolve; });
+    return { stream: (async function* () {
+      await requested;
+      yield { type: "session.error", properties: { sessionID: "session-1", error } };
+      acknowledge();
+    })() };
+  }) as unknown as OpencodeClient["event"]["subscribe"];
+  client.session.abort = vi.fn(async () => {
+    sendAbort?.();
+    await eventHandled;
+    return { data: true };
+  }) as unknown as OpencodeClient["session"]["abort"];
+}
+
 function fakeClient(
   state: FakeState,
   messages: unknown[] | ((promptCalls: number) => unknown[]),
@@ -661,6 +783,7 @@ function runContext(workspacePath: string, provider = "provider"): HarnessRunCon
       error: null,
       queuedAt: 0,
       startedAt: 0,
+      initialBuildStartedAt: null,
       completedAt: null,
       updatedAt: 0,
     },

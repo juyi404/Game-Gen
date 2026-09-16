@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 import path from "node:path";
+import { type ControlPlaneOptions } from "./application/contracts.js";
+import { ControlPlane } from "./application/control-plane.js";
+import { OrchestratorManager } from "./application/experiment-manager.js";
 import { loadBenchmarkConfig } from "./config.js";
-import { ControlPlane, type ControlPlaneOptions } from "./control-plane.js";
-import { BenchmarkDatabase } from "./database.js";
-import { OrchestratorManager } from "./manager.js";
-import { DashboardServer } from "./server/dashboard.js";
-import type { ResolvedBenchmarkConfig } from "./types.js";
+import type { ResolvedBenchmarkConfig } from "./domain/types.js";
+import { BenchmarkDatabase } from "./persistence/database.js";
+import { DashboardServer } from "./server/dashboard-server.js";
 
 interface CliOptions {
   configPath?: string;
@@ -48,7 +49,7 @@ async function main(): Promise<void> {
     if (closing) return;
     closing = true;
     console.log("\n正在安全关闭，未完成运行可在下次 serve 时恢复…");
-    await manager.shutdown().catch(() => undefined);
+    await controlPlane.shutdown().catch(() => undefined);
     await dashboard.close().catch(() => undefined);
     controlPlane.close();
     db.close();
@@ -62,23 +63,19 @@ async function main(): Promise<void> {
 
   if (command === "run") {
     if (!loaded) throw new Error("run 需要 Benchmark 配置文件");
-    const runtimeConfig = await controlPlane.prepareForRecovery(loaded.config);
-    const { experiment, orchestrator } = await manager.createAndStart(runtimeConfig, loaded.tasks);
+    const { experiment, orchestrator } = await controlPlane.createFromConfig(loaded.config, loaded.tasks);
     console.log(`实验 ID: ${experiment.id}`);
     console.log(`运行矩阵: ${experiment.totalRuns}`);
     const result = await orchestrator.waitForCompletion();
     console.log(`生成结束: ${result.status}`);
-    console.log(`源码根目录: ${runtimeConfig.runtime.outputDir}`);
+    console.log(`源码根目录: ${experiment.config.runtime.outputDir}`);
     if (result.status === "failed") process.exitCode = 1;
     await shutdown();
     return;
   }
 
-  const recoverable = db.listRecoverableExperiments();
-  const latest = recoverable[0];
+  const latest = await controlPlane.recoverLatestExperiment();
   if (latest) {
-    const runtimeConfig = await controlPlane.prepareForRecovery(latest.config);
-    await manager.startExisting(latest.id, runtimeConfig);
     console.log(`已恢复实验: ${latest.id} (${latest.status})`);
   } else {
     console.log("当前没有待恢复实验，面板以历史查看模式运行。");

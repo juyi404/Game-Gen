@@ -1,4 +1,4 @@
-import type { HarnessRunContext } from "./types.js";
+import type { HarnessRunContext } from "./domain/types.js";
 
 export function buildEffectiveSystemPrompt(
   benchmarkSystemPrompt: string,

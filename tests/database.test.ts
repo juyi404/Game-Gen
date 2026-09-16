@@ -1,17 +1,112 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { DatabaseSync } from "node:sqlite";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { loadBenchmarkConfig } from "../src/config.js";
 import { BenchmarkDatabase } from "../src/database.js";
 
 const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await Promise.all(temporaryDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
 });
 
 describe("benchmark database", () => {
+  it("migrates and persists infrastructure scopes independently of error messages", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "gamebench-db-scopes-"));
+    temporaryDirectories.push(directory);
+    const file = path.join(directory, "benchmark.sqlite");
+    const loaded = await loadBenchmarkConfig(path.resolve("examples/benchmark.mock.json"));
+    let db = new BenchmarkDatabase(file);
+    const experiment = db.createExperiment(loaded.config, loaded.tasks.slice(0, 1));
+    const run = db.listRuns(experiment.id)[0]!;
+    db.recordInfrastructureFailure(run.id, 1234, "provider");
+    db.updateRun(run.id, { status: "retrying", error: "translated message without engine details" });
+    db.close();
+    db = new BenchmarkDatabase(file);
+    expect(db.getInfrastructureRetryState(run.id)).toEqual({ attempts: 1, firstFailedAt: 1234, scope: "provider", kind: "infrastructure" });
+    db.recordInfrastructureFailure(run.id, 5678, "engine");
+    expect(db.getInfrastructureRetryState(run.id)).toEqual({ attempts: 2, firstFailedAt: 1234, scope: "engine", kind: "infrastructure" });
+    db.clearInfrastructureFailures(run.id);
+    expect(db.getInfrastructureRetryState(run.id)).toEqual({ attempts: 0, firstFailedAt: null, scope: null, kind: "infrastructure" });
+    db.close();
+
+    const old = new DatabaseSync(file);
+    old.exec("ALTER TABLE runs DROP COLUMN infra_scope");
+    old.exec("ALTER TABLE runs DROP COLUMN infra_failure_kind");
+    old.exec("UPDATE runs SET infra_attempts = 2, infra_first_failed_at = 1234");
+    old.close();
+    db = new BenchmarkDatabase(file);
+    try {
+      expect(db.getInfrastructureRetryState(run.id)).toEqual({ attempts: 2, firstFailedAt: 1234, scope: null, kind: "infrastructure" });
+      db.updateRun(run.id, { status: "failed" });
+      db.recordInfrastructureFailure(run.id, 5678, "provider");
+      const rollback = db.resetFailedRun(run.id);
+      expect(db.getInfrastructureRetryState(run.id).scope).toBeNull();
+      rollback();
+      expect(db.getInfrastructureRetryState(run.id).scope).toBe("provider");
+      db.recordInfrastructureFailure(run.id, 9000, undefined, "incomplete");
+      expect(db.getInfrastructureRetryState(run.id)).toMatchObject({ kind: "incomplete", scope: null });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("persists the renewed budget across automatic retries and process recovery", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "gamebench-db-budget-"));
+    temporaryDirectories.push(directory);
+    const loaded = await loadBenchmarkConfig(path.resolve("examples/benchmark.mock.json"));
+    const clock = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    const filePath = path.join(directory, "benchmark.sqlite");
+    let db = new BenchmarkDatabase(filePath);
+    try {
+      const experiment = db.createExperiment(loaded.config, loaded.tasks.slice(0, 1));
+      const run = db.claimRun(db.listRuns(experiment.id)[0]!.id)!;
+      expect(run.initialBuildStartedAt).toBe(1_000);
+      db.updateRun(run.id, { status: "failed", workspacePath: directory, sessionId: "old-session" });
+      clock.mockReturnValue(100_000);
+      db.resetFailedRun(run.id);
+      expect(db.claimRun(run.id)).toMatchObject({ startedAt: 1_000, initialBuildStartedAt: 100_000 });
+      db.updateRun(run.id, { sessionId: "new-session" });
+      clock.mockReturnValue(100_100);
+      db.retryRun(run.id, 0, "HTTP 503", { preserveProgress: true });
+      expect(db.claimRun(run.id)).toMatchObject({ initialBuildStartedAt: 100_000 });
+      db.close();
+      db = new BenchmarkDatabase(filePath);
+      clock.mockReturnValue(100_200);
+      db.recoverInterruptedRuns(experiment.id);
+      expect(db.claimRun(run.id)).toMatchObject({
+        startedAt: 1_000, initialBuildStartedAt: 100_000,
+        sessionId: "new-session", resumePending: true,
+      });
+    } finally { db.close(); }
+  });
+
+  it("migrates existing databases without renewing an already-started build budget", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "gamebench-db-budget-migration-"));
+    temporaryDirectories.push(directory);
+    const loaded = await loadBenchmarkConfig(path.resolve("examples/benchmark.mock.json"));
+    const filePath = path.join(directory, "benchmark.sqlite");
+    const original = new BenchmarkDatabase(filePath);
+    let runId: string;
+    let startedAt: number | null;
+    try {
+      const experiment = original.createExperiment(loaded.config, loaded.tasks.slice(0, 1));
+      const run = original.claimRun(original.listRuns(experiment.id)[0]!.id)!;
+      runId = run.id;
+      startedAt = run.startedAt;
+    } finally { original.close(); }
+    const legacy = new DatabaseSync(filePath);
+    try { legacy.exec("ALTER TABLE runs DROP COLUMN initial_build_started_at"); }
+    finally { legacy.close(); }
+    const migrated = new BenchmarkDatabase(filePath);
+    try {
+      expect(migrated.getRun(runId)).toMatchObject({ startedAt, initialBuildStartedAt: startedAt });
+    } finally { migrated.close(); }
+  });
+
   it("creates the complete task by model matrix", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "gamebench-db-"));
     temporaryDirectories.push(directory);
@@ -39,6 +134,30 @@ describe("benchmark database", () => {
     expect(lastPage.runs).toHaveLength(5);
     expect(lastPage.hasNextPage).toBe(false);
     db.close();
+  });
+
+  it("filters and paginates by model, matching status on that same model", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "gamebench-db-model-filter-"));
+    temporaryDirectories.push(directory);
+    const loaded = await loadBenchmarkConfig(path.resolve("examples/benchmark.mock.json"));
+    const db = new BenchmarkDatabase(path.join(directory, "benchmark.sqlite"));
+    try {
+      const experiment = db.createExperiment(loaded.config, loaded.tasks);
+      const runs = db.listRuns(experiment.id);
+      const first = runs[0]!;
+      const other = runs.find((run) => run.taskId === first.taskId && run.modelId !== first.modelId)!;
+      db.updateRun(other.id, { status: "failed" });
+      expect(db.listRunPage(experiment.id, { status: "failed" }).totalTasks).toBe(1);
+      expect(db.listRunPage(experiment.id, { modelId: first.modelId, status: "failed" }).totalTasks).toBe(0);
+      const failed = db.listRunPage(experiment.id, { modelId: other.modelId, status: "failed" });
+      expect(failed.runs.map((run) => run.id)).toEqual([other.id]);
+      const page = db.listRunPage(experiment.id, { modelId: first.modelId, pageSize: 1, page: 2 });
+      expect(page).toMatchObject({ page: 2, totalTasks: 2, totalPages: 2, hasNextPage: false });
+      expect(page.runs).toHaveLength(1);
+      expect(page.runs[0]!.modelId).toBe(first.modelId);
+      expect(db.listRunPage(experiment.id, { modelId: first.modelId, search: first.taskId }).runs.map((run) => run.id)).toEqual([first.id]);
+      expect(db.listRunPage(experiment.id, { modelId: "missing" }).totalTasks).toBe(0);
+    } finally { db.close(); }
   });
 
   it("preserves and repairs completed stage meaning when an experiment is cancelled", async () => {
@@ -127,7 +246,7 @@ describe("benchmark database", () => {
       sessionId: "kept-session",
     });
     const failure = db.recordInfrastructureFailure(run.id, 1_000);
-    expect(failure).toEqual({ attempts: 1, firstFailedAt: 1_000 });
+    expect(failure).toEqual({ attempts: 1, firstFailedAt: 1_000, scope: null, kind: "infrastructure" });
     db.retryRun(run.id, 0, "gateway down", { preserveProgress: true });
     expect(db.getRun(run.id)).toMatchObject({
       status: "retrying",
@@ -155,6 +274,7 @@ describe("benchmark database", () => {
     expect(db.getInfrastructureRetryState(run.id)).toEqual({
       attempts: 4,
       firstFailedAt: 1_000,
+      scope: null, kind: "infrastructure",
     });
     db.close();
   });

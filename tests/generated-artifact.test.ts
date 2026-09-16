@@ -70,6 +70,28 @@ describe("generated game artifact validation", () => {
       .toEqual(["./icon.png", "./hero.png", "./hero-2x.png", "./poster.png", "./intro.mp4"]);
   });
 
+  it.each(["inline", "external"])("rejects syntactically invalid %s module scripts", async (kind) => {
+    const directory = await workspace();
+    const code = "export const broken = ;";
+    await writeFile(path.join(directory, "game.js"), code);
+    await writeFile(path.join(directory, "index.html"), kind === "inline"
+      ? `<canvas></canvas><script type="module">${code}</script>`
+      : '<canvas></canvas><script type="module" src="./game.js"></script>');
+    await expect(validateGeneratedGameArtifacts(directory)).rejects.toThrow("JavaScript 语法错误");
+  });
+
+  it("accepts module imports, exports and top-level await without executing the game", async () => {
+    const directory = await workspace();
+    await writeFile(path.join(directory, "index.html"), '<canvas></canvas><script type="module" src="./game.js"></script>');
+    await writeFile(path.join(directory, "game.js"), [
+      'import { value } from "./logic.js";',
+      'export const result = await Promise.resolve(value);',
+      'throw new Error("validation must not execute generated code");',
+    ].join("\n"));
+    await writeFile(path.join(directory, "logic.js"), "export const value = 17;");
+    await expect(validateGeneratedGameArtifacts(directory)).resolves.toBeUndefined();
+  });
+
   it("rejects remote executable scripts because previews cannot connect externally", async () => {
     const directory = await workspace();
     await writeFile(

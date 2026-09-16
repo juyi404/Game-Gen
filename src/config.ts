@@ -1,13 +1,7 @@
 import { readFile, readdir, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
-import type {
-  ModelConfig,
-  PackyBillingSnapshot,
-  ResolvedBenchmarkConfig,
-  RoundDefinition,
-  TaskDefinition,
-} from "./types.js";
+import type { ModelConfig, PackyBillingSnapshot, ResolvedBenchmarkConfig, RoundDefinition, TaskDefinition } from "./domain/types.js";
 
 const MAX_ROUND_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_ROUND_IDLE_TIMEOUT_MS = 30 * 60 * 1000;

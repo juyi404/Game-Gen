@@ -1,8 +1,9 @@
+import { HarnessFailure } from "../src/domain/harness-failure.js";
 import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { loadBenchmarkConfig } from "../src/config.js";
 import { BenchmarkDatabase } from "../src/database.js";
 import { GenerationOrchestrator } from "../src/orchestrator.js";
@@ -16,6 +17,7 @@ import type {
 const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await Promise.all(temporaryDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
 });
 
@@ -483,6 +485,10 @@ describe("generation orchestrator", () => {
     const experiment = db.createExperiment(loaded.config, tasks);
     db.updateExperimentStatus(experiment.id, "paused");
     const pausedExperiment = db.getExperiment(experiment.id)!;
+    for (const run of db.listRuns(experiment.id)) {
+      db.recordInfrastructureFailure(run.id, Date.now(), "provider");
+      db.updateRun(run.id, { status: "retrying", error: "temporary provider outage", availableAt: 0 });
+    }
     const harness = new ProviderProbeProgressHarness();
     const orchestrator = new GenerationOrchestrator(
       db,
@@ -493,23 +499,7 @@ describe("generation orchestrator", () => {
     );
     try {
       await orchestrator.start();
-      const internals = orchestrator as unknown as {
-        providerCircuits: Map<string, {
-          scope: "provider";
-          failureCount: number;
-          blockedUntil: number;
-          probeInFlight: boolean;
-          error: string;
-        }>;
-      };
-      internals.providerCircuits.set("provider-a", {
-        scope: "provider",
-        failureCount: 1,
-        blockedUntil: Date.now() - 1,
-        probeInFlight: false,
-        error: "temporary provider outage",
-      });
-      for (const run of db.listRuns(experiment.id)) db.recordInfrastructureFailure(run.id);
+
 
       orchestrator.resume();
       await waitFor(() => harness.beginCalls === 3 && harness.maximumActive === 3, 4_000);
@@ -653,7 +643,7 @@ describe("generation orchestrator", () => {
       calls += 1; sessions.push(sessionId);
       await writeFile(path.join(context.workspacePath, "partial.txt"), "kept");
       context.emit("harness.step.completed", "info", "cutoff", { reason: finish });
-      if (calls <= 3) throw new Error(`OpenCode 上游响应连续断尾：finish=${finish}，已在原会话续作 0 次`);
+      if (calls <= 3) throw new HarnessFailure(`response cut off: ${finish}`, { kind: "incomplete", retryable: true });
       await writeFile(path.join(context.workspacePath, "index.html"), "continued");
       return { response: "completed" };
     };
@@ -693,6 +683,8 @@ describe("generation orchestrator", () => {
     let paidCalls = 0;
     let transportChecks = 0;
     let healthy = false;
+    let clockNow = Date.now();
+    vi.spyOn(Date, "now").mockImplementation(() => clockNow);
     const sessions: string[] = [];
     const harness: GenerationHarness = {
       async start() {}, async stop() {}, async abortRun() {},
@@ -703,14 +695,14 @@ describe("generation orchestrator", () => {
       },
       async executeRound(context, sessionId) {
         paidCalls += 1; sessions.push(sessionId);
-        if (paidCalls === 1) throw new Error("unknown certificate verification error");
+        if (paidCalls === 1) throw new HarnessFailure("provider certificate rejected", { kind: "infrastructure", retryable: true, scope: "provider" });
         await writeFile(path.join(context.workspacePath, "index.html"), "recovered");
         return { response: "recovered" };
       },
     };
     const orchestrator = new GenerationOrchestrator(db, experiment, loaded.config, tasks, harness);
     const internals = orchestrator as unknown as {
-      pump(): Promise<void>; providerCircuits: Map<string, { blockedUntil: number }>;
+      pump(): Promise<void>;
     };
     try {
       await orchestrator.start();
@@ -718,7 +710,7 @@ describe("generation orchestrator", () => {
       const firstRun = db.listRuns(experiment.id)[0]!;
       for (let checks = 1; checks <= 3; checks += 1) {
         db.updateRun(firstRun.id, { availableAt: 0 });
-        internals.providerCircuits.get("provider-a")!.blockedUntil = 0;
+        clockNow += 16 * 60_000;
         await internals.pump();
         expect(transportChecks).toBe(checks);
         expect(paidCalls).toBe(1);
@@ -726,7 +718,7 @@ describe("generation orchestrator", () => {
       }
       healthy = true;
       db.updateRun(firstRun.id, { availableAt: 0 });
-      internals.providerCircuits.get("provider-a")!.blockedUntil = 0;
+      clockNow += 16 * 60_000;
       await internals.pump();
       await orchestrator.waitForCompletion();
       expect(paidCalls).toBe(2);
@@ -980,7 +972,7 @@ class InfrastructureFailureHarness implements GenerationHarness {
   async stop(): Promise<void> {}
   async beginRun(): Promise<string> {
     this.beginCalls += 1;
-    throw new Error("fetch failed");
+    throw new HarnessFailure("transport disconnected", { kind: "infrastructure", retryable: true, scope: "engine" });
   }
   async executeRound(): Promise<HarnessRoundResult> {
     throw new Error("unexpected round execution");
@@ -997,7 +989,7 @@ class ProviderIsolationHarness implements GenerationHarness {
   }
   async executeRound(context: HarnessRunContext): Promise<HarnessRoundResult> {
     if (context.run.providerId === "provider-a") {
-      throw new Error("429 too many requests");
+      throw new HarnessFailure("provider capacity exceeded", { kind: "infrastructure", retryable: true, scope: "provider" });
     }
     await writeFile(path.join(context.workspacePath, "index.html"), "healthy", "utf8");
     return { response: "healthy" };
@@ -1024,7 +1016,7 @@ class ProviderProbeProgressHarness implements GenerationHarness {
   async executeRound(context: HarnessRunContext): Promise<HarnessRoundResult> {
     this.active += 1;
     this.maximumActive = Math.max(this.maximumActive, this.active);
-    context.emit("harness.step.completed", "info", "probe received a model step");
+    context.reportHealthy?.("provider");
     try {
       await this.gate;
       await writeFile(path.join(context.workspacePath, "index.html"), "probe complete", "utf8");
@@ -1047,9 +1039,7 @@ class QuotaFailureHarness implements GenerationHarness {
     return `quota-session-${context.run.id}`;
   }
   async executeRound(): Promise<HarnessRoundResult> {
-    throw new Error(
-      'APIError: Forbidden: {"error":{"message":"用户额度不足, 剩余额度: $-3.66","code":"insufficient_user_quota"}}',
-    );
+    throw new HarnessFailure("account requires manual intervention", { kind: "authorization", retryable: false, scope: "provider" });
   }
   async abortRun(): Promise<void> {}
   async releaseRun(): Promise<void> {}
@@ -1067,7 +1057,7 @@ class UnknownFinishOnceHarness implements GenerationHarness {
     const calls = (this.calls.get(context.run.id) ?? 0) + 1;
     this.calls.set(context.run.id, calls);
     if (calls === 1) {
-      throw new Error("OpenCode 上游响应连续断尾：finish=unknown，已在原会话续作 1 次");
+      throw new HarnessFailure("response was incomplete", { kind: "incomplete", retryable: true });
     }
     await writeFile(path.join(context.workspacePath, "index.html"), "continued", "utf8");
     return { response: "continued successfully" };
